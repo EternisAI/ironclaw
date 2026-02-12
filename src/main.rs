@@ -44,7 +44,7 @@ use ironclaw::secrets::SecretsCrypto;
 use ironclaw::secrets::PostgresSecretsStore;
 #[cfg(feature = "libsql")]
 use ironclaw::secrets::LibSqlSecretsStore;
-#[cfg(feature = "postgres")]
+#[cfg(any(feature = "postgres", feature = "libsql"))]
 use ironclaw::setup::{SetupConfig, SetupWizard};
 
 #[tokio::main]
@@ -273,7 +273,7 @@ async fn main() -> anyhow::Result<()> {
             // Load .env before running onboarding wizard
             let _ = dotenvy::dotenv();
 
-            #[cfg(feature = "postgres")]
+            #[cfg(any(feature = "postgres", feature = "libsql"))]
             {
                 let config = SetupConfig {
                     skip_auth: *skip_auth,
@@ -282,10 +282,10 @@ async fn main() -> anyhow::Result<()> {
                 let mut wizard = SetupWizard::with_config(config);
                 wizard.run().await?;
             }
-            #[cfg(not(feature = "postgres"))]
+            #[cfg(not(any(feature = "postgres", feature = "libsql")))]
             {
                 let _ = (skip_auth, channels_only);
-                eprintln!("Onboarding wizard requires the 'postgres' feature. Configure settings via environment variables instead.");
+                eprintln!("Onboarding wizard requires the 'postgres' or 'libsql' feature.");
             }
             return Ok(());
         }
@@ -297,8 +297,8 @@ async fn main() -> anyhow::Result<()> {
     // Load .env if present
     let _ = dotenvy::dotenv();
 
-    // Enhanced first-run detection (postgres only - libsql uses env vars)
-    #[cfg(feature = "postgres")]
+    // Enhanced first-run detection
+    #[cfg(any(feature = "postgres", feature = "libsql"))]
     if !cli.no_onboard {
         if let Some(reason) = check_onboard_needed().await {
             println!("Onboarding needed: {}", reason);
@@ -1177,12 +1177,17 @@ async fn main() -> anyhow::Result<()> {
 /// Check if onboarding is needed and return the reason.
 ///
 /// Returns `Some(reason)` if onboarding should be triggered, `None` otherwise.
-#[cfg(feature = "postgres")]
+#[cfg(any(feature = "postgres", feature = "libsql"))]
 async fn check_onboard_needed() -> Option<&'static str> {
     let bootstrap = ironclaw::bootstrap::BootstrapConfig::load();
 
     // Database not configured (and not in env)
-    if bootstrap.database_url.is_none() && std::env::var("DATABASE_URL").is_err() {
+    let has_db = bootstrap.database_url.is_some()
+        || std::env::var("DATABASE_URL").is_ok()
+        || std::env::var("LIBSQL_PATH").is_ok()
+        || ironclaw::config::default_libsql_path().exists();
+
+    if !has_db {
         return Some("Database not configured");
     }
 
