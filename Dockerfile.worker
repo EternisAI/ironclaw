@@ -21,8 +21,12 @@ RUN cargo build --release --bin ironclaw
 
 FROM debian:bookworm-slim
 
-# Install common development tools
-RUN apt-get update && apt-get install -y --no-install-recommends \
+# Add GitHub CLI apt repository, then install all dev tools in a single layer.
+RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+        | dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg \
+    && echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
+        > /etc/apt/sources.list.d/github-cli.list \
+    && apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     curl \
     git \
@@ -34,14 +38,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     python3 \
     python3-pip \
     python3-venv \
-    && rm -rf /var/lib/apt/lists/*
-
-# Install GitHub CLI (for PR checkout, diff, review)
-RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
-        | dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg \
-    && echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
-        > /etc/apt/sources.list.d/github-cli.list \
-    && apt-get update && apt-get install -y --no-install-recommends gh \
+    gh \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Rust toolchain for the sandbox user

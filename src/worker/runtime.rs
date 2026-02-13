@@ -492,6 +492,13 @@ fn truncate(s: &str, max: usize) -> String {
         while end > 0 && !s.is_char_boundary(end) {
             end -= 1;
         }
-        format!("{}...", &s[..end])
+        if end == 0 && !s.is_empty() {
+            // max fell inside the first (multi-byte) character; include it
+            // whole so we never produce a bare "...".
+            let first_char_end = s.char_indices().nth(1).map(|(i, _)| i).unwrap_or(s.len());
+            format!("{}...", &s[..first_char_end])
+        } else {
+            format!("{}...", &s[..end])
+        }
     }
 }

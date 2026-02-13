@@ -210,21 +210,30 @@ impl ToolRegistry {
         self.register_sync(Arc::new(create_tool));
         self.register_sync(Arc::new(ListJobsTool::new(Arc::clone(&context_manager))));
         self.register_sync(Arc::new(JobStatusTool::new(Arc::clone(&context_manager))));
-        self.register_sync(Arc::new(CancelJobTool::new(context_manager)));
+        self.register_sync(Arc::new(CancelJobTool::new(Arc::clone(&context_manager))));
+
+        // Base tools: create, list, status, cancel
+        let mut job_tool_count = 4;
 
         // Register event reader if store is available
         if let Some(store) = store {
-            self.register_sync(Arc::new(JobEventsTool::new(store)));
-            tracing::info!("Registered job_events tool");
+            self.register_sync(Arc::new(JobEventsTool::new(
+                store,
+                Arc::clone(&context_manager),
+            )));
+            job_tool_count += 1;
         }
 
         // Register prompt tool if queue is available
         if let Some(pq) = prompt_queue {
-            self.register_sync(Arc::new(JobPromptTool::new(pq)));
-            tracing::info!("Registered job_prompt tool");
+            self.register_sync(Arc::new(JobPromptTool::new(
+                pq,
+                Arc::clone(&context_manager),
+            )));
+            job_tool_count += 1;
         }
 
-        tracing::info!("Registered job management tools");
+        tracing::info!("Registered {} job management tools", job_tool_count);
     }
 
     /// Register extension management tools (search, install, auth, activate, list, remove).
