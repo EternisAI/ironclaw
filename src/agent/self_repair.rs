@@ -8,8 +8,8 @@ use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
 use crate::context::{ContextManager, JobState};
-use crate::error::RepairError;
 use crate::db::Database;
+use crate::error::RepairError;
 use crate::tools::{BuildRequirement, Language, SoftwareBuilder, SoftwareType, ToolRegistry};
 
 /// A job that has been detected as stuck.

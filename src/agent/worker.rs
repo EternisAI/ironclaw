@@ -10,8 +10,8 @@ use uuid::Uuid;
 use crate::agent::scheduler::WorkerMessage;
 use crate::agent::task::TaskOutput;
 use crate::context::{ContextManager, JobState};
-use crate::error::Error;
 use crate::db::Database;
+use crate::error::Error;
 use crate::llm::{
     ActionPlan, ChatMessage, LlmProvider, Reasoning, ReasoningContext, RespondResult, ToolSelection,
 };

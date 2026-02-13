@@ -11,14 +11,14 @@ use std::path::Path;
 
 use async_trait::async_trait;
 use chrono::{DateTime, NaiveDateTime, Utc};
-use libsql::{params, Connection, Database as LibSqlDatabase};
+use libsql::{Connection, Database as LibSqlDatabase, params};
 use rust_decimal::Decimal;
 use uuid::Uuid;
 
+use crate::agent::BrokenTool;
 use crate::agent::routine::{
     NotifyConfig, Routine, RoutineAction, RoutineGuardrails, RoutineRun, RunStatus, Trigger,
 };
-use crate::agent::BrokenTool;
 use crate::context::{ActionRecord, JobContext, JobState};
 use crate::db::Database;
 use crate::error::{DatabaseError, WorkspaceError};
@@ -75,7 +75,9 @@ impl LibSqlBackend {
         let db = libsql::Builder::new_local(":memory:")
             .build()
             .await
-            .map_err(|e| DatabaseError::Pool(format!("Failed to create in-memory database: {}", e)))?;
+            .map_err(|e| {
+                DatabaseError::Pool(format!("Failed to create in-memory database: {}", e))
+            })?;
 
         Ok(Self { db })
     }
@@ -95,9 +97,7 @@ impl LibSqlBackend {
         let db = libsql::Builder::new_remote_replica(path, url.to_string(), auth_token.to_string())
             .build()
             .await
-            .map_err(|e| {
-                DatabaseError::Pool(format!("Failed to open remote replica: {}", e))
-            })?;
+            .map_err(|e| DatabaseError::Pool(format!("Failed to open remote replica: {}", e)))?;
 
         Ok(Self { db })
     }
@@ -289,11 +289,11 @@ impl Database for LibSqlBackend {
         let conn = self.connect()?;
         let id = Uuid::new_v4();
         conn.execute(
-                "INSERT INTO conversations (id, channel, user_id, thread_id) VALUES (?1, ?2, ?3, ?4)",
-                params![id.to_string(), channel, user_id, opt_text(thread_id)],
-            )
-            .await
-            .map_err(|e| DatabaseError::Query(e.to_string()))?;
+            "INSERT INTO conversations (id, channel, user_id, thread_id) VALUES (?1, ?2, ?3, ?4)",
+            params![id.to_string(), channel, user_id, opt_text(thread_id)],
+        )
+        .await
+        .map_err(|e| DatabaseError::Query(e.to_string()))?;
         Ok(id)
     }
 
@@ -301,11 +301,11 @@ impl Database for LibSqlBackend {
         let conn = self.connect()?;
         let now = fmt_ts(&Utc::now());
         conn.execute(
-                "UPDATE conversations SET last_activity = ?2 WHERE id = ?1",
-                params![id.to_string(), now],
-            )
-            .await
-            .map_err(|e| DatabaseError::Query(e.to_string()))?;
+            "UPDATE conversations SET last_activity = ?2 WHERE id = ?1",
+            params![id.to_string(), now],
+        )
+        .await
+        .map_err(|e| DatabaseError::Query(e.to_string()))?;
         Ok(())
     }
 
@@ -337,15 +337,15 @@ impl Database for LibSqlBackend {
         let conn = self.connect()?;
         let now = fmt_ts(&Utc::now());
         conn.execute(
-                r#"
+            r#"
                 INSERT INTO conversations (id, channel, user_id, thread_id)
                 VALUES (?1, ?2, ?3, ?4)
                 ON CONFLICT (id) DO UPDATE SET last_activity = ?5
                 "#,
-                params![id.to_string(), channel, user_id, opt_text(thread_id), now],
-            )
-            .await
-            .map_err(|e| DatabaseError::Query(e.to_string()))?;
+            params![id.to_string(), channel, user_id, opt_text(thread_id), now],
+        )
+        .await
+        .map_err(|e| DatabaseError::Query(e.to_string()))?;
         Ok(())
     }
 
@@ -382,14 +382,22 @@ impl Database for LibSqlBackend {
             .map_err(|e| DatabaseError::Query(e.to_string()))?;
 
         let mut results = Vec::new();
-        while let Some(row) = rows.next().await.map_err(|e| DatabaseError::Query(e.to_string()))? {
+        while let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| DatabaseError::Query(e.to_string()))?
+        {
             let metadata = get_json(&row, 3);
             let thread_type = metadata
                 .get("thread_type")
                 .and_then(|v| v.as_str())
                 .map(String::from);
             results.push(ConversationSummary {
-                id: row.get::<String>(0).unwrap_or_default().parse().unwrap_or_default(),
+                id: row
+                    .get::<String>(0)
+                    .unwrap_or_default()
+                    .parse()
+                    .unwrap_or_default(),
                 started_at: get_ts(&row, 1),
                 last_activity: get_ts(&row, 2),
                 message_count: get_i64(&row, 4),
@@ -420,7 +428,11 @@ impl Database for LibSqlBackend {
             .await
             .map_err(|e| DatabaseError::Query(e.to_string()))?;
 
-        if let Some(row) = rows.next().await.map_err(|e| DatabaseError::Query(e.to_string()))? {
+        if let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| DatabaseError::Query(e.to_string()))?
+        {
             let id_str: String = row.get(0).unwrap_or_default();
             return id_str
                 .parse()
@@ -431,11 +443,11 @@ impl Database for LibSqlBackend {
         let id = Uuid::new_v4();
         let metadata = serde_json::json!({"thread_type": "assistant", "title": "Assistant"});
         conn.execute(
-                "INSERT INTO conversations (id, channel, user_id, metadata) VALUES (?1, ?2, ?3, ?4)",
-                params![id.to_string(), channel, user_id, metadata.to_string()],
-            )
-            .await
-            .map_err(|e| DatabaseError::Query(e.to_string()))?;
+            "INSERT INTO conversations (id, channel, user_id, metadata) VALUES (?1, ?2, ?3, ?4)",
+            params![id.to_string(), channel, user_id, metadata.to_string()],
+        )
+        .await
+        .map_err(|e| DatabaseError::Query(e.to_string()))?;
         Ok(id)
     }
 
@@ -448,11 +460,11 @@ impl Database for LibSqlBackend {
         let conn = self.connect()?;
         let id = Uuid::new_v4();
         conn.execute(
-                "INSERT INTO conversations (id, channel, user_id, metadata) VALUES (?1, ?2, ?3, ?4)",
-                params![id.to_string(), channel, user_id, metadata.to_string()],
-            )
-            .await
-            .map_err(|e| DatabaseError::Query(e.to_string()))?;
+            "INSERT INTO conversations (id, channel, user_id, metadata) VALUES (?1, ?2, ?3, ?4)",
+            params![id.to_string(), channel, user_id, metadata.to_string()],
+        )
+        .await
+        .map_err(|e| DatabaseError::Query(e.to_string()))?;
         Ok(id)
     }
 
@@ -468,33 +480,37 @@ impl Database for LibSqlBackend {
 
         let mut rows = if let Some(before_ts) = before {
             conn.query(
-                    r#"
+                r#"
                     SELECT id, role, content, created_at
                     FROM conversation_messages
                     WHERE conversation_id = ?1 AND created_at < ?2
                     ORDER BY created_at DESC
                     LIMIT ?3
                     "#,
-                    params![cid, fmt_ts(&before_ts), fetch_limit],
-                )
-                .await
+                params![cid, fmt_ts(&before_ts), fetch_limit],
+            )
+            .await
         } else {
             conn.query(
-                    r#"
+                r#"
                     SELECT id, role, content, created_at
                     FROM conversation_messages
                     WHERE conversation_id = ?1
                     ORDER BY created_at DESC
                     LIMIT ?2
                     "#,
-                    params![cid, fetch_limit],
-                )
-                .await
+                params![cid, fetch_limit],
+            )
+            .await
         }
         .map_err(|e| DatabaseError::Query(e.to_string()))?;
 
         let mut all = Vec::new();
-        while let Some(row) = rows.next().await.map_err(|e| DatabaseError::Query(e.to_string()))? {
+        while let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| DatabaseError::Query(e.to_string()))?
+        {
             all.push(ConversationMessage {
                 id: get_text(&row, 0).parse().unwrap_or_default(),
                 role: get_text(&row, 1),
@@ -519,11 +535,11 @@ impl Database for LibSqlBackend {
         // SQLite: use json_patch to merge the key
         let patch = serde_json::json!({ key: value });
         conn.execute(
-                "UPDATE conversations SET metadata = json_patch(metadata, ?2) WHERE id = ?1",
-                params![id.to_string(), patch.to_string()],
-            )
-            .await
-            .map_err(|e| DatabaseError::Query(e.to_string()))?;
+            "UPDATE conversations SET metadata = json_patch(metadata, ?2) WHERE id = ?1",
+            params![id.to_string(), patch.to_string()],
+        )
+        .await
+        .map_err(|e| DatabaseError::Query(e.to_string()))?;
         Ok(())
     }
 
@@ -540,7 +556,11 @@ impl Database for LibSqlBackend {
             .await
             .map_err(|e| DatabaseError::Query(e.to_string()))?;
 
-        match rows.next().await.map_err(|e| DatabaseError::Query(e.to_string()))? {
+        match rows
+            .next()
+            .await
+            .map_err(|e| DatabaseError::Query(e.to_string()))?
+        {
             Some(row) => Ok(Some(get_json(&row, 0))),
             None => Ok(None),
         }
@@ -565,7 +585,11 @@ impl Database for LibSqlBackend {
             .map_err(|e| DatabaseError::Query(e.to_string()))?;
 
         let mut messages = Vec::new();
-        while let Some(row) = rows.next().await.map_err(|e| DatabaseError::Query(e.to_string()))? {
+        while let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| DatabaseError::Query(e.to_string()))?
+        {
             messages.push(ConversationMessage {
                 id: get_text(&row, 0).parse().unwrap_or_default(),
                 role: get_text(&row, 1),
@@ -663,7 +687,11 @@ impl Database for LibSqlBackend {
             .await
             .map_err(|e| DatabaseError::Query(e.to_string()))?;
 
-        match rows.next().await.map_err(|e| DatabaseError::Query(e.to_string()))? {
+        match rows
+            .next()
+            .await
+            .map_err(|e| DatabaseError::Query(e.to_string()))?
+        {
             Some(row) => {
                 let status_str = get_text(&row, 5);
                 let state = parse_job_state(&status_str);
@@ -684,6 +712,8 @@ impl Database for LibSqlBackend {
                     estimated_duration: estimated_time_secs
                         .map(|s| std::time::Duration::from_secs(s as u64)),
                     actual_cost: get_decimal(&row, 12),
+                    total_tokens_used: 0,
+                    max_tokens: 0,
                     repair_attempts: get_i64(&row, 13) as u32,
                     created_at: get_ts(&row, 14),
                     started_at: get_opt_ts(&row, 15),
@@ -704,11 +734,11 @@ impl Database for LibSqlBackend {
     ) -> Result<(), DatabaseError> {
         let conn = self.connect()?;
         conn.execute(
-                "UPDATE agent_jobs SET status = ?2, failure_reason = ?3 WHERE id = ?1",
-                params![id.to_string(), status.to_string(), opt_text(failure_reason)],
-            )
-            .await
-            .map_err(|e| DatabaseError::Query(e.to_string()))?;
+            "UPDATE agent_jobs SET status = ?2, failure_reason = ?3 WHERE id = ?1",
+            params![id.to_string(), status.to_string(), opt_text(failure_reason)],
+        )
+        .await
+        .map_err(|e| DatabaseError::Query(e.to_string()))?;
         Ok(())
     }
 
@@ -716,11 +746,11 @@ impl Database for LibSqlBackend {
         let conn = self.connect()?;
         let now = fmt_ts(&Utc::now());
         conn.execute(
-                "UPDATE agent_jobs SET status = 'stuck', stuck_since = ?2 WHERE id = ?1",
-                params![id.to_string(), now],
-            )
-            .await
-            .map_err(|e| DatabaseError::Query(e.to_string()))?;
+            "UPDATE agent_jobs SET status = 'stuck', stuck_since = ?2 WHERE id = ?1",
+            params![id.to_string(), now],
+        )
+        .await
+        .map_err(|e| DatabaseError::Query(e.to_string()))?;
         Ok(())
     }
 
@@ -732,7 +762,11 @@ impl Database for LibSqlBackend {
             .map_err(|e| DatabaseError::Query(e.to_string()))?;
 
         let mut ids = Vec::new();
-        while let Some(row) = rows.next().await.map_err(|e| DatabaseError::Query(e.to_string()))? {
+        while let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| DatabaseError::Query(e.to_string()))?
+        {
             if let Ok(id_str) = row.get::<String>(0) {
                 if let Ok(id) = id_str.parse() {
                     ids.push(id);
@@ -744,48 +778,41 @@ impl Database for LibSqlBackend {
 
     // ==================== Actions ====================
 
-    async fn save_action(
-        &self,
-        job_id: Uuid,
-        action: &ActionRecord,
-    ) -> Result<(), DatabaseError> {
+    async fn save_action(&self, job_id: Uuid, action: &ActionRecord) -> Result<(), DatabaseError> {
         let conn = self.connect()?;
         let duration_ms = action.duration.as_millis() as i64;
         let warnings_json = serde_json::to_string(&action.sanitization_warnings)
             .map_err(|e| DatabaseError::Serialization(e.to_string()))?;
 
         conn.execute(
-                r#"
+            r#"
                 INSERT INTO job_actions (
                     id, job_id, sequence_num, tool_name, input, output_raw, output_sanitized,
                     sanitization_warnings, cost, duration_ms, success, error_message, created_at
                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
                 "#,
-                params![
-                    action.id.to_string(),
-                    job_id.to_string(),
-                    action.sequence as i64,
-                    action.tool_name.as_str(),
-                    action.input.to_string(),
-                    opt_text(action.output_raw.as_deref()),
-                    opt_text_owned(action.output_sanitized.as_ref().map(|v| v.to_string())),
-                    warnings_json,
-                    opt_text_owned(action.cost.map(|d| d.to_string())),
-                    duration_ms,
-                    action.success as i64,
-                    opt_text(action.error.as_deref()),
-                    fmt_ts(&action.executed_at),
-                ],
-            )
-            .await
-            .map_err(|e| DatabaseError::Query(e.to_string()))?;
+            params![
+                action.id.to_string(),
+                job_id.to_string(),
+                action.sequence as i64,
+                action.tool_name.as_str(),
+                action.input.to_string(),
+                opt_text(action.output_raw.as_deref()),
+                opt_text_owned(action.output_sanitized.as_ref().map(|v| v.to_string())),
+                warnings_json,
+                opt_text_owned(action.cost.map(|d| d.to_string())),
+                duration_ms,
+                action.success as i64,
+                opt_text(action.error.as_deref()),
+                fmt_ts(&action.executed_at),
+            ],
+        )
+        .await
+        .map_err(|e| DatabaseError::Query(e.to_string()))?;
         Ok(())
     }
 
-    async fn get_job_actions(
-        &self,
-        job_id: Uuid,
-    ) -> Result<Vec<ActionRecord>, DatabaseError> {
+    async fn get_job_actions(&self, job_id: Uuid) -> Result<Vec<ActionRecord>, DatabaseError> {
         let conn = self.connect()?;
         let mut rows = conn
             .query(
@@ -800,16 +827,20 @@ impl Database for LibSqlBackend {
             .map_err(|e| DatabaseError::Query(e.to_string()))?;
 
         let mut actions = Vec::new();
-        while let Some(row) = rows.next().await.map_err(|e| DatabaseError::Query(e.to_string()))? {
-            let warnings: Vec<String> = serde_json::from_str(&get_text(&row, 6)).unwrap_or_default();
+        while let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| DatabaseError::Query(e.to_string()))?
+        {
+            let warnings: Vec<String> =
+                serde_json::from_str(&get_text(&row, 6)).unwrap_or_default();
             actions.push(ActionRecord {
                 id: get_text(&row, 0).parse().unwrap_or_default(),
                 sequence: get_i64(&row, 1) as u32,
                 tool_name: get_text(&row, 2),
                 input: get_json(&row, 3),
                 output_raw: get_opt_text(&row, 4),
-                output_sanitized: get_opt_text(&row, 5)
-                    .and_then(|s| serde_json::from_str(&s).ok()),
+                output_sanitized: get_opt_text(&row, 5).and_then(|s| serde_json::from_str(&s).ok()),
                 sanitization_warnings: warnings,
                 cost: get_opt_decimal(&row, 7),
                 duration: std::time::Duration::from_millis(get_i64(&row, 8) as u64),
@@ -911,7 +942,7 @@ impl Database for LibSqlBackend {
     async fn save_sandbox_job(&self, job: &SandboxJobRecord) -> Result<(), DatabaseError> {
         let conn = self.connect()?;
         conn.execute(
-                r#"
+            r#"
                 INSERT INTO agent_jobs (
                     id, title, description, status, source, user_id, project_dir,
                     success, failure_reason, created_at, started_at, completed_at
@@ -923,28 +954,25 @@ impl Database for LibSqlBackend {
                     started_at = excluded.started_at,
                     completed_at = excluded.completed_at
                 "#,
-                params![
-                    job.id.to_string(),
-                    job.task.as_str(),
-                    job.status.as_str(),
-                    job.user_id.as_str(),
-                    job.project_dir.as_str(),
-                    job.success.map(|b| b as i64),
-                    opt_text(job.failure_reason.as_deref()),
-                    fmt_ts(&job.created_at),
-                    fmt_opt_ts(&job.started_at),
-                    fmt_opt_ts(&job.completed_at),
-                ],
-            )
-            .await
-            .map_err(|e| DatabaseError::Query(e.to_string()))?;
+            params![
+                job.id.to_string(),
+                job.task.as_str(),
+                job.status.as_str(),
+                job.user_id.as_str(),
+                job.project_dir.as_str(),
+                job.success.map(|b| b as i64),
+                opt_text(job.failure_reason.as_deref()),
+                fmt_ts(&job.created_at),
+                fmt_opt_ts(&job.started_at),
+                fmt_opt_ts(&job.completed_at),
+            ],
+        )
+        .await
+        .map_err(|e| DatabaseError::Query(e.to_string()))?;
         Ok(())
     }
 
-    async fn get_sandbox_job(
-        &self,
-        id: Uuid,
-    ) -> Result<Option<SandboxJobRecord>, DatabaseError> {
+    async fn get_sandbox_job(&self, id: Uuid) -> Result<Option<SandboxJobRecord>, DatabaseError> {
         let conn = self.connect()?;
         let mut rows = conn
             .query(
@@ -958,7 +986,11 @@ impl Database for LibSqlBackend {
             .await
             .map_err(|e| DatabaseError::Query(e.to_string()))?;
 
-        match rows.next().await.map_err(|e| DatabaseError::Query(e.to_string()))? {
+        match rows
+            .next()
+            .await
+            .map_err(|e| DatabaseError::Query(e.to_string()))?
+        {
             Some(row) => Ok(Some(SandboxJobRecord {
                 id: get_text(&row, 0).parse().unwrap_or_default(),
                 task: get_text(&row, 1),
@@ -991,7 +1023,11 @@ impl Database for LibSqlBackend {
             .map_err(|e| DatabaseError::Query(e.to_string()))?;
 
         let mut jobs = Vec::new();
-        while let Some(row) = rows.next().await.map_err(|e| DatabaseError::Query(e.to_string()))? {
+        while let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| DatabaseError::Query(e.to_string()))?
+        {
             jobs.push(SandboxJobRecord {
                 id: get_text(&row, 0).parse().unwrap_or_default(),
                 task: get_text(&row, 1),
@@ -1019,7 +1055,7 @@ impl Database for LibSqlBackend {
     ) -> Result<(), DatabaseError> {
         let conn = self.connect()?;
         conn.execute(
-                r#"
+            r#"
                 UPDATE agent_jobs SET
                     status = ?2,
                     success = COALESCE(?3, success),
@@ -1028,17 +1064,17 @@ impl Database for LibSqlBackend {
                     completed_at = COALESCE(?6, completed_at)
                 WHERE id = ?1 AND source = 'sandbox'
                 "#,
-                params![
-                    id.to_string(),
-                    status,
-                    success.map(|b| b as i64),
-                    message,
-                    fmt_opt_ts(&started_at),
-                    fmt_opt_ts(&completed_at),
-                ],
-            )
-            .await
-            .map_err(|e| DatabaseError::Query(e.to_string()))?;
+            params![
+                id.to_string(),
+                status,
+                success.map(|b| b as i64),
+                message,
+                fmt_opt_ts(&started_at),
+                fmt_opt_ts(&completed_at),
+            ],
+        )
+        .await
+        .map_err(|e| DatabaseError::Query(e.to_string()))?;
         Ok(())
     }
 
@@ -1075,7 +1111,11 @@ impl Database for LibSqlBackend {
             .map_err(|e| DatabaseError::Query(e.to_string()))?;
 
         let mut summary = SandboxJobSummary::default();
-        while let Some(row) = rows.next().await.map_err(|e| DatabaseError::Query(e.to_string()))? {
+        while let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| DatabaseError::Query(e.to_string()))?
+        {
             let status = get_text(&row, 0);
             let count = get_i64(&row, 1) as usize;
             summary.total += count;
@@ -1110,7 +1150,11 @@ impl Database for LibSqlBackend {
             .map_err(|e| DatabaseError::Query(e.to_string()))?;
 
         let mut jobs = Vec::new();
-        while let Some(row) = rows.next().await.map_err(|e| DatabaseError::Query(e.to_string()))? {
+        while let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| DatabaseError::Query(e.to_string()))?
+        {
             jobs.push(SandboxJobRecord {
                 id: get_text(&row, 0).parse().unwrap_or_default(),
                 task: get_text(&row, 1),
@@ -1141,7 +1185,11 @@ impl Database for LibSqlBackend {
             .map_err(|e| DatabaseError::Query(e.to_string()))?;
 
         let mut summary = SandboxJobSummary::default();
-        while let Some(row) = rows.next().await.map_err(|e| DatabaseError::Query(e.to_string()))? {
+        while let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| DatabaseError::Query(e.to_string()))?
+        {
             let status = get_text(&row, 0);
             let count = get_i64(&row, 1) as usize;
             summary.total += count;
@@ -1177,25 +1225,18 @@ impl Database for LibSqlBackend {
         Ok(found.is_some())
     }
 
-    async fn update_sandbox_job_mode(
-        &self,
-        id: Uuid,
-        mode: &str,
-    ) -> Result<(), DatabaseError> {
+    async fn update_sandbox_job_mode(&self, id: Uuid, mode: &str) -> Result<(), DatabaseError> {
         let conn = self.connect()?;
         conn.execute(
-                "UPDATE agent_jobs SET job_mode = ?2 WHERE id = ?1",
-                params![id.to_string(), mode],
-            )
-            .await
-            .map_err(|e| DatabaseError::Query(e.to_string()))?;
+            "UPDATE agent_jobs SET job_mode = ?2 WHERE id = ?1",
+            params![id.to_string(), mode],
+        )
+        .await
+        .map_err(|e| DatabaseError::Query(e.to_string()))?;
         Ok(())
     }
 
-    async fn get_sandbox_job_mode(
-        &self,
-        id: Uuid,
-    ) -> Result<Option<String>, DatabaseError> {
+    async fn get_sandbox_job_mode(&self, id: Uuid) -> Result<Option<String>, DatabaseError> {
         let conn = self.connect()?;
         let mut rows = conn
             .query(
@@ -1205,7 +1246,11 @@ impl Database for LibSqlBackend {
             .await
             .map_err(|e| DatabaseError::Query(e.to_string()))?;
 
-        match rows.next().await.map_err(|e| DatabaseError::Query(e.to_string()))? {
+        match rows
+            .next()
+            .await
+            .map_err(|e| DatabaseError::Query(e.to_string()))?
+        {
             Some(row) => Ok(Some(get_text(&row, 0))),
             None => Ok(None),
         }
@@ -1221,18 +1266,15 @@ impl Database for LibSqlBackend {
     ) -> Result<(), DatabaseError> {
         let conn = self.connect()?;
         conn.execute(
-                "INSERT INTO job_events (job_id, event_type, data) VALUES (?1, ?2, ?3)",
-                params![job_id.to_string(), event_type, data.to_string()],
-            )
-            .await
-            .map_err(|e| DatabaseError::Query(e.to_string()))?;
+            "INSERT INTO job_events (job_id, event_type, data) VALUES (?1, ?2, ?3)",
+            params![job_id.to_string(), event_type, data.to_string()],
+        )
+        .await
+        .map_err(|e| DatabaseError::Query(e.to_string()))?;
         Ok(())
     }
 
-    async fn list_job_events(
-        &self,
-        job_id: Uuid,
-    ) -> Result<Vec<JobEventRecord>, DatabaseError> {
+    async fn list_job_events(&self, job_id: Uuid) -> Result<Vec<JobEventRecord>, DatabaseError> {
         let conn = self.connect()?;
         let mut rows = conn
             .query(
@@ -1246,7 +1288,11 @@ impl Database for LibSqlBackend {
             .map_err(|e| DatabaseError::Query(e.to_string()))?;
 
         let mut events = Vec::new();
-        while let Some(row) = rows.next().await.map_err(|e| DatabaseError::Query(e.to_string()))? {
+        while let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| DatabaseError::Query(e.to_string()))?
+        {
             events.push(JobEventRecord {
                 id: get_i64(&row, 0),
                 job_id: get_text(&row, 1).parse().unwrap_or_default(),
@@ -1268,10 +1314,7 @@ impl Database for LibSqlBackend {
         let action_config = routine.action.to_config_json();
         let cooldown_secs = routine.guardrails.cooldown.as_secs() as i64;
         let max_concurrent = routine.guardrails.max_concurrent as i64;
-        let dedup_window_secs = routine
-            .guardrails
-            .dedup_window
-            .map(|d| d.as_secs() as i64);
+        let dedup_window_secs = routine.guardrails.dedup_window.map(|d| d.as_secs() as i64);
 
         conn.execute(
                 r#"
@@ -1328,7 +1371,11 @@ impl Database for LibSqlBackend {
             .await
             .map_err(|e| DatabaseError::Query(e.to_string()))?;
 
-        match rows.next().await.map_err(|e| DatabaseError::Query(e.to_string()))? {
+        match rows
+            .next()
+            .await
+            .map_err(|e| DatabaseError::Query(e.to_string()))?
+        {
             Some(row) => Ok(Some(row_to_routine_libsql(&row)?)),
             None => Ok(None),
         }
@@ -1342,13 +1389,20 @@ impl Database for LibSqlBackend {
         let conn = self.connect()?;
         let mut rows = conn
             .query(
-                &format!("SELECT {} FROM routines WHERE user_id = ?1 AND name = ?2", ROUTINE_COLUMNS),
+                &format!(
+                    "SELECT {} FROM routines WHERE user_id = ?1 AND name = ?2",
+                    ROUTINE_COLUMNS
+                ),
                 params![user_id, name],
             )
             .await
             .map_err(|e| DatabaseError::Query(e.to_string()))?;
 
-        match rows.next().await.map_err(|e| DatabaseError::Query(e.to_string()))? {
+        match rows
+            .next()
+            .await
+            .map_err(|e| DatabaseError::Query(e.to_string()))?
+        {
             Some(row) => Ok(Some(row_to_routine_libsql(&row)?)),
             None => Ok(None),
         }
@@ -1358,14 +1412,21 @@ impl Database for LibSqlBackend {
         let conn = self.connect()?;
         let mut rows = conn
             .query(
-                &format!("SELECT {} FROM routines WHERE user_id = ?1 ORDER BY name", ROUTINE_COLUMNS),
+                &format!(
+                    "SELECT {} FROM routines WHERE user_id = ?1 ORDER BY name",
+                    ROUTINE_COLUMNS
+                ),
                 params![user_id],
             )
             .await
             .map_err(|e| DatabaseError::Query(e.to_string()))?;
 
         let mut routines = Vec::new();
-        while let Some(row) = rows.next().await.map_err(|e| DatabaseError::Query(e.to_string()))? {
+        while let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| DatabaseError::Query(e.to_string()))?
+        {
             routines.push(row_to_routine_libsql(&row)?);
         }
         Ok(routines)
@@ -1375,14 +1436,21 @@ impl Database for LibSqlBackend {
         let conn = self.connect()?;
         let mut rows = conn
             .query(
-                &format!("SELECT {} FROM routines WHERE enabled = 1 AND trigger_type = 'event'", ROUTINE_COLUMNS),
+                &format!(
+                    "SELECT {} FROM routines WHERE enabled = 1 AND trigger_type = 'event'",
+                    ROUTINE_COLUMNS
+                ),
                 (),
             )
             .await
             .map_err(|e| DatabaseError::Query(e.to_string()))?;
 
         let mut routines = Vec::new();
-        while let Some(row) = rows.next().await.map_err(|e| DatabaseError::Query(e.to_string()))? {
+        while let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| DatabaseError::Query(e.to_string()))?
+        {
             routines.push(row_to_routine_libsql(&row)?);
         }
         Ok(routines)
@@ -1403,7 +1471,11 @@ impl Database for LibSqlBackend {
             .map_err(|e| DatabaseError::Query(e.to_string()))?;
 
         let mut routines = Vec::new();
-        while let Some(row) = rows.next().await.map_err(|e| DatabaseError::Query(e.to_string()))? {
+        while let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| DatabaseError::Query(e.to_string()))?
+        {
             routines.push(row_to_routine_libsql(&row)?);
         }
         Ok(routines)
@@ -1417,14 +1489,11 @@ impl Database for LibSqlBackend {
         let action_config = routine.action.to_config_json();
         let cooldown_secs = routine.guardrails.cooldown.as_secs() as i64;
         let max_concurrent = routine.guardrails.max_concurrent as i64;
-        let dedup_window_secs = routine
-            .guardrails
-            .dedup_window
-            .map(|d| d.as_secs() as i64);
+        let dedup_window_secs = routine.guardrails.dedup_window.map(|d| d.as_secs() as i64);
         let now = fmt_ts(&Utc::now());
 
         conn.execute(
-                r#"
+            r#"
                 UPDATE routines SET
                     name = ?2, description = ?3, enabled = ?4,
                     trigger_type = ?5, trigger_config = ?6,
@@ -1436,30 +1505,30 @@ impl Database for LibSqlBackend {
                     updated_at = ?19
                 WHERE id = ?1
                 "#,
-                params![
-                    routine.id.to_string(),
-                    routine.name.as_str(),
-                    routine.description.as_str(),
-                    routine.enabled as i64,
-                    trigger_type,
-                    trigger_config.to_string(),
-                    action_type,
-                    action_config.to_string(),
-                    cooldown_secs,
-                    max_concurrent,
-                    dedup_window_secs,
-                    opt_text(routine.notify.channel.as_deref()),
-                    routine.notify.user.as_str(),
-                    routine.notify.on_success as i64,
-                    routine.notify.on_failure as i64,
-                    routine.notify.on_attention as i64,
-                    routine.state.to_string(),
-                    fmt_opt_ts(&routine.next_fire_at),
-                    now,
-                ],
-            )
-            .await
-            .map_err(|e| DatabaseError::Query(e.to_string()))?;
+            params![
+                routine.id.to_string(),
+                routine.name.as_str(),
+                routine.description.as_str(),
+                routine.enabled as i64,
+                trigger_type,
+                trigger_config.to_string(),
+                action_type,
+                action_config.to_string(),
+                cooldown_secs,
+                max_concurrent,
+                dedup_window_secs,
+                opt_text(routine.notify.channel.as_deref()),
+                routine.notify.user.as_str(),
+                routine.notify.on_success as i64,
+                routine.notify.on_failure as i64,
+                routine.notify.on_attention as i64,
+                routine.state.to_string(),
+                fmt_opt_ts(&routine.next_fire_at),
+                now,
+            ],
+        )
+        .await
+        .map_err(|e| DatabaseError::Query(e.to_string()))?;
         Ok(())
     }
 
@@ -1475,25 +1544,25 @@ impl Database for LibSqlBackend {
         let conn = self.connect()?;
         let now = fmt_ts(&Utc::now());
         conn.execute(
-                r#"
+            r#"
                 UPDATE routines SET
                     last_run_at = ?2, next_fire_at = ?3,
                     run_count = ?4, consecutive_failures = ?5,
                     state = ?6, updated_at = ?7
                 WHERE id = ?1
                 "#,
-                params![
-                    id.to_string(),
-                    fmt_ts(&last_run_at),
-                    fmt_opt_ts(&next_fire_at),
-                    run_count as i64,
-                    consecutive_failures as i64,
-                    state.to_string(),
-                    now,
-                ],
-            )
-            .await
-            .map_err(|e| DatabaseError::Query(e.to_string()))?;
+            params![
+                id.to_string(),
+                fmt_ts(&last_run_at),
+                fmt_opt_ts(&next_fire_at),
+                run_count as i64,
+                consecutive_failures as i64,
+                state.to_string(),
+                now,
+            ],
+        )
+        .await
+        .map_err(|e| DatabaseError::Query(e.to_string()))?;
         Ok(())
     }
 
@@ -1514,24 +1583,24 @@ impl Database for LibSqlBackend {
     async fn create_routine_run(&self, run: &RoutineRun) -> Result<(), DatabaseError> {
         let conn = self.connect()?;
         conn.execute(
-                r#"
+            r#"
                 INSERT INTO routine_runs (
                     id, routine_id, trigger_type, trigger_detail,
                     started_at, status, job_id
                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
                 "#,
-                params![
-                    run.id.to_string(),
-                    run.routine_id.to_string(),
-                    run.trigger_type.as_str(),
-                    opt_text(run.trigger_detail.as_deref()),
-                    fmt_ts(&run.started_at),
-                    run.status.to_string(),
-                    opt_text_owned(run.job_id.map(|id| id.to_string())),
-                ],
-            )
-            .await
-            .map_err(|e| DatabaseError::Query(e.to_string()))?;
+            params![
+                run.id.to_string(),
+                run.routine_id.to_string(),
+                run.trigger_type.as_str(),
+                opt_text(run.trigger_detail.as_deref()),
+                fmt_ts(&run.started_at),
+                run.status.to_string(),
+                opt_text_owned(run.job_id.map(|id| id.to_string())),
+            ],
+        )
+        .await
+        .map_err(|e| DatabaseError::Query(e.to_string()))?;
         Ok(())
     }
 
@@ -1545,22 +1614,22 @@ impl Database for LibSqlBackend {
         let conn = self.connect()?;
         let now = fmt_ts(&Utc::now());
         conn.execute(
-                r#"
+            r#"
                 UPDATE routine_runs SET
                     completed_at = ?5, status = ?2,
                     result_summary = ?3, tokens_used = ?4
                 WHERE id = ?1
                 "#,
-                params![
-                    id.to_string(),
-                    status.to_string(),
-                    opt_text(result_summary),
-                    tokens_used.map(|t| t as i64),
-                    now,
-                ],
-            )
-            .await
-            .map_err(|e| DatabaseError::Query(e.to_string()))?;
+            params![
+                id.to_string(),
+                status.to_string(),
+                opt_text(result_summary),
+                tokens_used.map(|t| t as i64),
+                now,
+            ],
+        )
+        .await
+        .map_err(|e| DatabaseError::Query(e.to_string()))?;
         Ok(())
     }
 
@@ -1582,16 +1651,17 @@ impl Database for LibSqlBackend {
             .map_err(|e| DatabaseError::Query(e.to_string()))?;
 
         let mut runs = Vec::new();
-        while let Some(row) = rows.next().await.map_err(|e| DatabaseError::Query(e.to_string()))? {
+        while let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| DatabaseError::Query(e.to_string()))?
+        {
             runs.push(row_to_routine_run_libsql(&row)?);
         }
         Ok(runs)
     }
 
-    async fn count_running_routine_runs(
-        &self,
-        routine_id: Uuid,
-    ) -> Result<i64, DatabaseError> {
+    async fn count_running_routine_runs(&self, routine_id: Uuid) -> Result<i64, DatabaseError> {
         let conn = self.connect()?;
         let mut rows = conn
             .query(
@@ -1601,7 +1671,11 @@ impl Database for LibSqlBackend {
             .await
             .map_err(|e| DatabaseError::Query(e.to_string()))?;
 
-        match rows.next().await.map_err(|e| DatabaseError::Query(e.to_string()))? {
+        match rows
+            .next()
+            .await
+            .map_err(|e| DatabaseError::Query(e.to_string()))?
+        {
             Some(row) => Ok(get_i64(&row, 0)),
             None => Ok(0),
         }
@@ -1617,7 +1691,7 @@ impl Database for LibSqlBackend {
         let conn = self.connect()?;
         let now = fmt_ts(&Utc::now());
         conn.execute(
-                r#"
+            r#"
                 INSERT INTO tool_failures (id, tool_name, error_message, error_count, last_failure)
                 VALUES (?1, ?2, ?3, 1, ?4)
                 ON CONFLICT (tool_name) DO UPDATE SET
@@ -1625,17 +1699,14 @@ impl Database for LibSqlBackend {
                     error_count = tool_failures.error_count + 1,
                     last_failure = ?4
                 "#,
-                params![Uuid::new_v4().to_string(), tool_name, error_message, now],
-            )
-            .await
-            .map_err(|e| DatabaseError::Query(e.to_string()))?;
+            params![Uuid::new_v4().to_string(), tool_name, error_message, now],
+        )
+        .await
+        .map_err(|e| DatabaseError::Query(e.to_string()))?;
         Ok(())
     }
 
-    async fn get_broken_tools(
-        &self,
-        threshold: i32,
-    ) -> Result<Vec<BrokenTool>, DatabaseError> {
+    async fn get_broken_tools(&self, threshold: i32) -> Result<Vec<BrokenTool>, DatabaseError> {
         let conn = self.connect()?;
         let mut rows = conn
             .query(
@@ -1652,7 +1723,11 @@ impl Database for LibSqlBackend {
             .map_err(|e| DatabaseError::Query(e.to_string()))?;
 
         let mut tools = Vec::new();
-        while let Some(row) = rows.next().await.map_err(|e| DatabaseError::Query(e.to_string()))? {
+        while let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| DatabaseError::Query(e.to_string()))?
+        {
             tools.push(BrokenTool {
                 name: get_text(&row, 0),
                 last_error: get_opt_text(&row, 1),
@@ -1671,22 +1746,22 @@ impl Database for LibSqlBackend {
         let conn = self.connect()?;
         let now = fmt_ts(&Utc::now());
         conn.execute(
-                "UPDATE tool_failures SET repaired_at = ?2, error_count = 0 WHERE tool_name = ?1",
-                params![tool_name, now],
-            )
-            .await
-            .map_err(|e| DatabaseError::Query(e.to_string()))?;
+            "UPDATE tool_failures SET repaired_at = ?2, error_count = 0 WHERE tool_name = ?1",
+            params![tool_name, now],
+        )
+        .await
+        .map_err(|e| DatabaseError::Query(e.to_string()))?;
         Ok(())
     }
 
     async fn increment_repair_attempts(&self, tool_name: &str) -> Result<(), DatabaseError> {
         let conn = self.connect()?;
         conn.execute(
-                "UPDATE tool_failures SET repair_attempts = repair_attempts + 1 WHERE tool_name = ?1",
-                params![tool_name],
-            )
-            .await
-            .map_err(|e| DatabaseError::Query(e.to_string()))?;
+            "UPDATE tool_failures SET repair_attempts = repair_attempts + 1 WHERE tool_name = ?1",
+            params![tool_name],
+        )
+        .await
+        .map_err(|e| DatabaseError::Query(e.to_string()))?;
         Ok(())
     }
 
@@ -1706,7 +1781,11 @@ impl Database for LibSqlBackend {
             .await
             .map_err(|e| DatabaseError::Query(e.to_string()))?;
 
-        match rows.next().await.map_err(|e| DatabaseError::Query(e.to_string()))? {
+        match rows
+            .next()
+            .await
+            .map_err(|e| DatabaseError::Query(e.to_string()))?
+        {
             Some(row) => Ok(Some(get_json(&row, 0))),
             None => Ok(None),
         }
@@ -1726,7 +1805,11 @@ impl Database for LibSqlBackend {
             .await
             .map_err(|e| DatabaseError::Query(e.to_string()))?;
 
-        match rows.next().await.map_err(|e| DatabaseError::Query(e.to_string()))? {
+        match rows
+            .next()
+            .await
+            .map_err(|e| DatabaseError::Query(e.to_string()))?
+        {
             Some(row) => Ok(Some(SettingRow {
                 key: get_text(&row, 0),
                 value: get_json(&row, 1),
@@ -1745,25 +1828,21 @@ impl Database for LibSqlBackend {
         let conn = self.connect()?;
         let now = fmt_ts(&Utc::now());
         conn.execute(
-                r#"
+            r#"
                 INSERT INTO settings (user_id, key, value, updated_at)
                 VALUES (?1, ?2, ?3, ?4)
                 ON CONFLICT (user_id, key) DO UPDATE SET
                     value = excluded.value,
                     updated_at = ?4
                 "#,
-                params![user_id, key, value.to_string(), now],
-            )
-            .await
-            .map_err(|e| DatabaseError::Query(e.to_string()))?;
+            params![user_id, key, value.to_string(), now],
+        )
+        .await
+        .map_err(|e| DatabaseError::Query(e.to_string()))?;
         Ok(())
     }
 
-    async fn delete_setting(
-        &self,
-        user_id: &str,
-        key: &str,
-    ) -> Result<bool, DatabaseError> {
+    async fn delete_setting(&self, user_id: &str, key: &str) -> Result<bool, DatabaseError> {
         let conn = self.connect()?;
         let count = conn
             .execute(
@@ -1775,10 +1854,7 @@ impl Database for LibSqlBackend {
         Ok(count > 0)
     }
 
-    async fn list_settings(
-        &self,
-        user_id: &str,
-    ) -> Result<Vec<SettingRow>, DatabaseError> {
+    async fn list_settings(&self, user_id: &str) -> Result<Vec<SettingRow>, DatabaseError> {
         let conn = self.connect()?;
         let mut rows = conn
             .query(
@@ -1789,7 +1865,11 @@ impl Database for LibSqlBackend {
             .map_err(|e| DatabaseError::Query(e.to_string()))?;
 
         let mut settings = Vec::new();
-        while let Some(row) = rows.next().await.map_err(|e| DatabaseError::Query(e.to_string()))? {
+        while let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| DatabaseError::Query(e.to_string()))?
+        {
             settings.push(SettingRow {
                 key: get_text(&row, 0),
                 value: get_json(&row, 1),
@@ -1813,7 +1893,11 @@ impl Database for LibSqlBackend {
             .map_err(|e| DatabaseError::Query(e.to_string()))?;
 
         let mut map = HashMap::new();
-        while let Some(row) = rows.next().await.map_err(|e| DatabaseError::Query(e.to_string()))? {
+        while let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| DatabaseError::Query(e.to_string()))?
+        {
             map.insert(get_text(&row, 0), get_json(&row, 1));
         }
         Ok(map)
@@ -1865,7 +1949,11 @@ impl Database for LibSqlBackend {
             .await
             .map_err(|e| DatabaseError::Query(e.to_string()))?;
 
-        match rows.next().await.map_err(|e| DatabaseError::Query(e.to_string()))? {
+        match rows
+            .next()
+            .await
+            .map_err(|e| DatabaseError::Query(e.to_string()))?
+        {
             Some(row) => Ok(get_i64(&row, 0) > 0),
             None => Ok(false),
         }
@@ -1898,9 +1986,12 @@ impl Database for LibSqlBackend {
                 reason: format!("Query failed: {}", e),
             })?;
 
-        match rows.next().await.map_err(|e| WorkspaceError::SearchFailed {
-            reason: format!("Query failed: {}", e),
-        })? {
+        match rows
+            .next()
+            .await
+            .map_err(|e| WorkspaceError::SearchFailed {
+                reason: format!("Query failed: {}", e),
+            })? {
             Some(row) => Ok(row_to_memory_document(&row)),
             None => Err(WorkspaceError::DocumentNotFound {
                 doc_type: path.to_string(),
@@ -1927,9 +2018,12 @@ impl Database for LibSqlBackend {
                 reason: format!("Query failed: {}", e),
             })?;
 
-        match rows.next().await.map_err(|e| WorkspaceError::SearchFailed {
-            reason: format!("Query failed: {}", e),
-        })? {
+        match rows
+            .next()
+            .await
+            .map_err(|e| WorkspaceError::SearchFailed {
+                reason: format!("Query failed: {}", e),
+            })? {
             Some(row) => Ok(row_to_memory_document(&row)),
             None => Err(WorkspaceError::DocumentNotFound {
                 doc_type: "unknown".to_string(),
@@ -1958,17 +2052,17 @@ impl Database for LibSqlBackend {
         let id = Uuid::new_v4();
         let agent_id_str = agent_id.map(|id| id.to_string());
         conn.execute(
-                r#"
+            r#"
                 INSERT INTO memory_documents (id, user_id, agent_id, path, content, metadata)
                 VALUES (?1, ?2, ?3, ?4, '', '{}')
                 ON CONFLICT (user_id, agent_id, path) DO NOTHING
                 "#,
-                params![id.to_string(), user_id, agent_id_str.as_deref(), path],
-            )
-            .await
-            .map_err(|e| WorkspaceError::SearchFailed {
-                reason: format!("Insert failed: {}", e),
-            })?;
+            params![id.to_string(), user_id, agent_id_str.as_deref(), path],
+        )
+        .await
+        .map_err(|e| WorkspaceError::SearchFailed {
+            reason: format!("Insert failed: {}", e),
+        })?;
 
         self.get_document_by_path(user_id, agent_id, path).await
     }
@@ -1979,13 +2073,13 @@ impl Database for LibSqlBackend {
         })?;
         let now = fmt_ts(&Utc::now());
         conn.execute(
-                "UPDATE memory_documents SET content = ?2, updated_at = ?3 WHERE id = ?1",
-                params![id.to_string(), content, now],
-            )
-            .await
-            .map_err(|e| WorkspaceError::SearchFailed {
-                reason: format!("Update failed: {}", e),
-            })?;
+            "UPDATE memory_documents SET content = ?2, updated_at = ?3 WHERE id = ?1",
+            params![id.to_string(), content, now],
+        )
+        .await
+        .map_err(|e| WorkspaceError::SearchFailed {
+            reason: format!("Update failed: {}", e),
+        })?;
         Ok(())
     }
 
@@ -2003,13 +2097,13 @@ impl Database for LibSqlBackend {
         })?;
         let agent_id_str = agent_id.map(|id| id.to_string());
         conn.execute(
-                "DELETE FROM memory_documents WHERE user_id = ?1 AND agent_id IS ?2 AND path = ?3",
-                params![user_id, agent_id_str.as_deref(), path],
-            )
-            .await
-            .map_err(|e| WorkspaceError::SearchFailed {
-                reason: format!("Delete failed: {}", e),
-            })?;
+            "DELETE FROM memory_documents WHERE user_id = ?1 AND agent_id IS ?2 AND path = ?3",
+            params![user_id, agent_id_str.as_deref(), path],
+        )
+        .await
+        .map_err(|e| WorkspaceError::SearchFailed {
+            reason: format!("Delete failed: {}", e),
+        })?;
         Ok(())
     }
 
@@ -2054,9 +2148,13 @@ impl Database for LibSqlBackend {
 
         let mut entries_map: HashMap<String, WorkspaceEntry> = HashMap::new();
 
-        while let Some(row) = rows.next().await.map_err(|e| WorkspaceError::SearchFailed {
-            reason: format!("Query failed: {}", e),
-        })? {
+        while let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| WorkspaceError::SearchFailed {
+                reason: format!("Query failed: {}", e),
+            })?
+        {
             let full_path = get_text(&row, 0);
             let updated_at = get_opt_ts(&row, 1);
             let content_preview = get_opt_text(&row, 2);
@@ -2135,9 +2233,13 @@ impl Database for LibSqlBackend {
             })?;
 
         let mut paths = Vec::new();
-        while let Some(row) = rows.next().await.map_err(|e| WorkspaceError::SearchFailed {
-            reason: format!("Query failed: {}", e),
-        })? {
+        while let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| WorkspaceError::SearchFailed {
+                reason: format!("Query failed: {}", e),
+            })?
+        {
             paths.push(get_text(&row, 0));
         }
         Ok(paths)
@@ -2169,9 +2271,13 @@ impl Database for LibSqlBackend {
             })?;
 
         let mut docs = Vec::new();
-        while let Some(row) = rows.next().await.map_err(|e| WorkspaceError::SearchFailed {
-            reason: format!("Query failed: {}", e),
-        })? {
+        while let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| WorkspaceError::SearchFailed {
+                reason: format!("Query failed: {}", e),
+            })?
+        {
             docs.push(row_to_memory_document(&row));
         }
         Ok(docs)
@@ -2184,13 +2290,13 @@ impl Database for LibSqlBackend {
             reason: e.to_string(),
         })?;
         conn.execute(
-                "DELETE FROM memory_chunks WHERE document_id = ?1",
-                params![document_id.to_string()],
-            )
-            .await
-            .map_err(|e| WorkspaceError::ChunkingFailed {
-                reason: format!("Delete failed: {}", e),
-            })?;
+            "DELETE FROM memory_chunks WHERE document_id = ?1",
+            params![document_id.to_string()],
+        )
+        .await
+        .map_err(|e| WorkspaceError::ChunkingFailed {
+            reason: format!("Delete failed: {}", e),
+        })?;
         Ok(())
     }
 
@@ -2212,22 +2318,22 @@ impl Database for LibSqlBackend {
         });
 
         conn.execute(
-                r#"
+            r#"
                 INSERT INTO memory_chunks (id, document_id, chunk_index, content, embedding)
                 VALUES (?1, ?2, ?3, ?4, ?5)
                 "#,
-                params![
-                    id.to_string(),
-                    document_id.to_string(),
-                    chunk_index as i64,
-                    content,
-                    embedding_blob.map(libsql::Value::Blob),
-                ],
-            )
-            .await
-            .map_err(|e| WorkspaceError::ChunkingFailed {
-                reason: format!("Insert failed: {}", e),
-            })?;
+            params![
+                id.to_string(),
+                document_id.to_string(),
+                chunk_index as i64,
+                content,
+                embedding_blob.map(libsql::Value::Blob),
+            ],
+        )
+        .await
+        .map_err(|e| WorkspaceError::ChunkingFailed {
+            reason: format!("Insert failed: {}", e),
+        })?;
         Ok(id)
     }
 
@@ -2236,19 +2342,21 @@ impl Database for LibSqlBackend {
         chunk_id: Uuid,
         embedding: &[f32],
     ) -> Result<(), WorkspaceError> {
-        let conn = self.connect().map_err(|e| WorkspaceError::EmbeddingFailed {
-            reason: e.to_string(),
-        })?;
+        let conn = self
+            .connect()
+            .map_err(|e| WorkspaceError::EmbeddingFailed {
+                reason: e.to_string(),
+            })?;
         let bytes: Vec<u8> = embedding.iter().flat_map(|f| f.to_le_bytes()).collect();
 
         conn.execute(
-                "UPDATE memory_chunks SET embedding = ?2 WHERE id = ?1",
-                params![chunk_id.to_string(), libsql::Value::Blob(bytes)],
-            )
-            .await
-            .map_err(|e| WorkspaceError::EmbeddingFailed {
-                reason: format!("Update failed: {}", e),
-            })?;
+            "UPDATE memory_chunks SET embedding = ?2 WHERE id = ?1",
+            params![chunk_id.to_string(), libsql::Value::Blob(bytes)],
+        )
+        .await
+        .map_err(|e| WorkspaceError::EmbeddingFailed {
+            reason: format!("Update failed: {}", e),
+        })?;
         Ok(())
     }
 
@@ -2280,9 +2388,13 @@ impl Database for LibSqlBackend {
             })?;
 
         let mut chunks = Vec::new();
-        while let Some(row) = rows.next().await.map_err(|e| WorkspaceError::SearchFailed {
-            reason: format!("Query failed: {}", e),
-        })? {
+        while let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| WorkspaceError::SearchFailed {
+                reason: format!("Query failed: {}", e),
+            })?
+        {
             chunks.push(MemoryChunk {
                 id: get_text(&row, 0).parse().unwrap_or_default(),
                 document_id: get_text(&row, 1).parse().unwrap_or_default(),
@@ -2333,8 +2445,10 @@ impl Database for LibSqlBackend {
                 })?;
 
             let mut results = Vec::new();
-            while let Some(row) =
-                rows.next().await.map_err(|e| WorkspaceError::SearchFailed {
+            while let Some(row) = rows
+                .next()
+                .await
+                .map_err(|e| WorkspaceError::SearchFailed {
                     reason: format!("FTS row fetch failed: {}", e),
                 })?
             {
@@ -2380,8 +2494,10 @@ impl Database for LibSqlBackend {
                 })?;
 
             let mut results = Vec::new();
-            while let Some(row) =
-                rows.next().await.map_err(|e| WorkspaceError::SearchFailed {
+            while let Some(row) = rows
+                .next()
+                .await
+                .map_err(|e| WorkspaceError::SearchFailed {
                     reason: format!("Vector row fetch failed: {}", e),
                 })?
             {
@@ -2398,7 +2514,9 @@ impl Database for LibSqlBackend {
         };
 
         if embedding.is_some() && !config.use_vector {
-            tracing::warn!("Embedding provided but vector search is disabled in config; using FTS-only results");
+            tracing::warn!(
+                "Embedding provided but vector search is disabled in config; using FTS-only results"
+            );
         }
 
         Ok(reciprocal_rank_fusion(fts_results, vector_results, config))

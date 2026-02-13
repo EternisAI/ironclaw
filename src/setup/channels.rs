@@ -12,9 +12,9 @@ use reqwest::Client;
 use secrecy::{ExposeSecret, SecretString};
 use serde::Deserialize;
 
-use crate::secrets::{CreateSecretParams, SecretsStore};
 #[cfg(feature = "postgres")]
 use crate::secrets::SecretsCrypto;
+use crate::secrets::{CreateSecretParams, SecretsStore};
 use crate::settings::Settings;
 use crate::setup::prompts::{
     confirm, input, optional_input, print_error, print_info, print_success, secret_input,

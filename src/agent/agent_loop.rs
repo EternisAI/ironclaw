@@ -19,9 +19,9 @@ use crate::channels::{ChannelManager, IncomingMessage, OutgoingResponse, StatusU
 use crate::config::{AgentConfig, HeartbeatConfig, RoutineConfig};
 use crate::context::ContextManager;
 use crate::context::JobContext;
+use crate::db::Database;
 use crate::error::Error;
 use crate::extensions::ExtensionManager;
-use crate::db::Database;
 use crate::llm::{ChatMessage, LlmProvider, Reasoning, ReasoningContext, RespondResult};
 use crate::safety::SafetyLayer;
 use crate::tools::ToolRegistry;

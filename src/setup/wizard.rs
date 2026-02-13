@@ -270,12 +270,17 @@ impl SetupWizard {
         if let Some(ref path) = existing_path {
             print_info(&format!("Existing database path: {}", path));
             if confirm("Use this database?", true).map_err(SetupError::Io)? {
-                let turso_url = std::env::var("LIBSQL_URL").ok()
+                let turso_url = std::env::var("LIBSQL_URL")
+                    .ok()
                     .or_else(|| self.settings.libsql_url.clone());
                 let turso_token = std::env::var("LIBSQL_AUTH_TOKEN").ok();
 
                 match self
-                    .test_database_connection_libsql(path, turso_url.as_deref(), turso_token.as_deref())
+                    .test_database_connection_libsql(
+                        path,
+                        turso_url.as_deref(),
+                        turso_token.as_deref(),
+                    )
                     .await
                 {
                     Ok(()) => {
@@ -309,8 +314,8 @@ impl SetupWizard {
 
         // Ask about Turso cloud sync
         println!();
-        let use_turso = confirm("Enable Turso cloud sync (remote replica)?", false)
-            .map_err(SetupError::Io)?;
+        let use_turso =
+            confirm("Enable Turso cloud sync (remote replica)?", false).map_err(SetupError::Io)?;
 
         let (turso_url, turso_token) = if use_turso {
             print_info("Enter your Turso database URL and auth token.");
@@ -349,11 +354,9 @@ impl SetupWizard {
                 if let Some(url) = turso_url {
                     self.settings.libsql_url = Some(url);
                 }
-                return Ok(());
+                Ok(())
             }
-            Err(e) => {
-                return Err(SetupError::Database(format!("Connection failed: {}", e)));
-            }
+            Err(e) => Err(SetupError::Database(format!("Connection failed: {}", e))),
         }
     }
 
@@ -786,9 +789,10 @@ impl SetupWizard {
             }
         };
 
-        let store: Arc<dyn SecretsStore> = Arc::new(
-            crate::secrets::PostgresSecretsStore::new(pool, Arc::clone(crypto)),
-        );
+        let store: Arc<dyn SecretsStore> = Arc::new(crate::secrets::PostgresSecretsStore::new(
+            pool,
+            Arc::clone(crypto),
+        ));
         Ok(Some(store))
     }
 
@@ -802,9 +806,10 @@ impl SetupWizard {
             let conn = backend
                 .connect()
                 .map_err(|e| SetupError::Database(format!("Failed to create connection: {}", e)))?;
-            let store: Arc<dyn SecretsStore> = Arc::new(
-                crate::secrets::LibSqlSecretsStore::new(conn, Arc::clone(crypto)),
-            );
+            let store: Arc<dyn SecretsStore> = Arc::new(crate::secrets::LibSqlSecretsStore::new(
+                conn,
+                Arc::clone(crypto),
+            ));
             Ok(Some(store))
         } else {
             Ok(None)

@@ -7,7 +7,6 @@ use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitEx
 
 use ironclaw::{
     agent::{Agent, AgentDeps, SessionManager},
-    pairing::PairingStore,
     channels::{
         ChannelManager, GatewayChannel, HttpChannel, ReplChannel, WebhookServer,
         WebhookServerConfig,
@@ -18,8 +17,7 @@ use ironclaw::{
         web::log_layer::{LogBroadcaster, WebLogLayer},
     },
     cli::{
-        Cli, Command, run_mcp_command, run_pairing_command, run_status_command,
-        run_tool_command,
+        Cli, Command, run_mcp_command, run_pairing_command, run_status_command, run_tool_command,
     },
     config::Config,
     context::ContextManager,
@@ -29,6 +27,7 @@ use ironclaw::{
         ContainerJobConfig, ContainerJobManager, OrchestratorApi, TokenStore,
         api::OrchestratorState,
     },
+    pairing::PairingStore,
     safety::SafetyLayer,
     secrets::SecretsStore,
     tools::{
@@ -39,11 +38,9 @@ use ironclaw::{
     workspace::{EmbeddingProvider, NearAiEmbeddings, OpenAiEmbeddings, Workspace},
 };
 
-use ironclaw::secrets::SecretsCrypto;
 #[cfg(feature = "postgres")]
 use ironclaw::secrets::PostgresSecretsStore;
-#[cfg(feature = "libsql")]
-use ironclaw::secrets::LibSqlSecretsStore;
+use ironclaw::secrets::SecretsCrypto;
 #[cfg(any(feature = "postgres", feature = "libsql"))]
 use ironclaw::setup::{SetupConfig, SetupWizard};
 
@@ -92,7 +89,9 @@ async fn main() -> anyhow::Result<()> {
 
             // Memory commands need database (and optionally embeddings)
             let _ = dotenvy::dotenv();
-            let config = Config::from_env().await.map_err(|e| anyhow::anyhow!("{}", e))?;
+            let config = Config::from_env()
+                .await
+                .map_err(|e| anyhow::anyhow!("{}", e))?;
 
             // Set up embeddings if available
             let session = ironclaw::llm::create_session_manager(ironclaw::llm::SessionConfig {
@@ -138,7 +137,8 @@ async fn main() -> anyhow::Result<()> {
                     .await
                     .map_err(|e| anyhow::anyhow!("{}", e))?;
 
-            return ironclaw::cli::run_memory_command_with_db(mem_cmd.clone(), db, embeddings).await;
+            return ironclaw::cli::run_memory_command_with_db(mem_cmd.clone(), db, embeddings)
+                .await;
         }
         Some(Command::Pairing(pairing_cmd)) => {
             tracing_subscriber::fmt()
@@ -358,16 +358,22 @@ async fn main() -> anyhow::Result<()> {
         match config.database.backend {
             #[cfg(feature = "libsql")]
             ironclaw::config::DatabaseBackend::LibSql => {
-                use ironclaw::db::libsql_backend::LibSqlBackend;
                 use ironclaw::db::Database as _;
+                use ironclaw::db::libsql_backend::LibSqlBackend;
                 use secrecy::ExposeSecret as _;
 
                 let default_path = ironclaw::config::default_libsql_path();
-                let db_path = config.database.libsql_path.as_deref()
+                let db_path = config
+                    .database
+                    .libsql_path
+                    .as_deref()
                     .unwrap_or(&default_path);
 
                 let backend = if let Some(ref url) = config.database.libsql_url {
-                    let token = config.database.libsql_auth_token.as_ref()
+                    let token = config
+                        .database
+                        .libsql_auth_token
+                        .as_ref()
                         .expect("LIBSQL_AUTH_TOKEN required when LIBSQL_URL is set");
                     LibSqlBackend::new_remote_replica(db_path, url, token.expose_secret()).await?
                 } else {
@@ -384,9 +390,12 @@ async fn main() -> anyhow::Result<()> {
             #[cfg(feature = "postgres")]
             _ => {
                 use ironclaw::db::Database as _;
-                let pg = ironclaw::db::postgres::PgBackend::new(&config.database).await
+                let pg = ironclaw::db::postgres::PgBackend::new(&config.database)
+                    .await
                     .map_err(|e| anyhow::anyhow!("{}", e))?;
-                pg.run_migrations().await.map_err(|e| anyhow::anyhow!("{}", e))?;
+                pg.run_migrations()
+                    .await
+                    .map_err(|e| anyhow::anyhow!("{}", e))?;
                 tracing::info!("PostgreSQL database connected and migrations applied");
 
                 pg_pool = Some(pg.pool());
@@ -394,7 +403,9 @@ async fn main() -> anyhow::Result<()> {
             }
             #[cfg(not(feature = "postgres"))]
             _ => {
-                anyhow::bail!("No database backend available. Enable 'postgres' or 'libsql' feature.");
+                anyhow::bail!(
+                    "No database backend available. Enable 'postgres' or 'libsql' feature."
+                );
             }
         }
     };
@@ -526,11 +537,11 @@ async fn main() -> anyhow::Result<()> {
         }
         #[cfg(all(feature = "libsql", not(feature = "postgres")))]
         {
-            if let (Some(conn), Some(master_key)) = (libsql_conn.take(), config.secrets.master_key()) {
+            if let (Some(conn), Some(master_key)) =
+                (libsql_conn.take(), config.secrets.master_key())
+            {
                 match SecretsCrypto::new(master_key.clone()) {
-                    Ok(crypto) => Some(Arc::new(
-                        LibSqlSecretsStore::new(conn, Arc::new(crypto)),
-                    )
+                    Ok(crypto) => Some(Arc::new(LibSqlSecretsStore::new(conn, Arc::new(crypto)))
                         as Arc<dyn SecretsStore + Send + Sync>),
                     Err(e) => {
                         tracing::warn!("Failed to initialize secrets crypto: {}", e);

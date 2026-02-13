@@ -375,7 +375,8 @@ impl ExtensionManager {
     ) -> Result<(), crate::tools::mcp::config::ConfigError> {
         config.validate()?;
         if let Some(ref store) = self.store {
-            crate::tools::mcp::config::add_mcp_server_db(store.as_ref(), &self.user_id, config).await
+            crate::tools::mcp::config::add_mcp_server_db(store.as_ref(), &self.user_id, config)
+                .await
         } else {
             crate::tools::mcp::config::add_mcp_server(config).await
         }
@@ -386,7 +387,8 @@ impl ExtensionManager {
         name: &str,
     ) -> Result<(), crate::tools::mcp::config::ConfigError> {
         if let Some(ref store) = self.store {
-            crate::tools::mcp::config::remove_mcp_server_db(store.as_ref(), &self.user_id, name).await
+            crate::tools::mcp::config::remove_mcp_server_db(store.as_ref(), &self.user_id, name)
+                .await
         } else {
             crate::tools::mcp::config::remove_mcp_server(name).await
         }

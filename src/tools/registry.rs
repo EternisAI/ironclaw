@@ -6,8 +6,8 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 
 use crate::context::ContextManager;
-use crate::extensions::ExtensionManager;
 use crate::db::Database;
+use crate::extensions::ExtensionManager;
 use crate::llm::{LlmProvider, ToolDefinition};
 use crate::orchestrator::job_manager::ContainerJobManager;
 use crate::safety::SafetyLayer;

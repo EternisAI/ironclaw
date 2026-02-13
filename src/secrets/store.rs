@@ -340,7 +340,10 @@ impl SecretsStore for LibSqlSecretsStore {
             .map(|dt| dt.to_rfc3339_opts(chrono::SecondsFormat::Millis, true));
 
         // Start transaction for atomic upsert + read-back
-        let tx = self.conn.transaction().await
+        let tx = self
+            .conn
+            .transaction()
+            .await
             .map_err(|e| SecretError::Database(e.to_string()))?;
 
         tx.execute(
@@ -390,7 +393,8 @@ impl SecretsStore for LibSqlSecretsStore {
 
         let secret = libsql_row_to_secret(&row)?;
 
-        tx.commit().await
+        tx.commit()
+            .await
             .map_err(|e| SecretError::Database(e.to_string()))?;
 
         Ok(secret)

@@ -26,8 +26,8 @@ use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 use uuid::Uuid;
 
-use crate::agent::routine::{Routine, RoutineRun, RunStatus};
 use crate::agent::BrokenTool;
+use crate::agent::routine::{Routine, RoutineRun, RunStatus};
 use crate::context::{ActionRecord, JobContext, JobState};
 use crate::error::DatabaseError;
 use crate::error::WorkspaceError;
@@ -214,17 +214,10 @@ pub trait Database: Send + Sync {
     // ==================== Actions ====================
 
     /// Save a job action.
-    async fn save_action(
-        &self,
-        job_id: Uuid,
-        action: &ActionRecord,
-    ) -> Result<(), DatabaseError>;
+    async fn save_action(&self, job_id: Uuid, action: &ActionRecord) -> Result<(), DatabaseError>;
 
     /// Get actions for a job.
-    async fn get_job_actions(
-        &self,
-        job_id: Uuid,
-    ) -> Result<Vec<ActionRecord>, DatabaseError>;
+    async fn get_job_actions(&self, job_id: Uuid) -> Result<Vec<ActionRecord>, DatabaseError>;
 
     // ==================== LLM Calls ====================
 
@@ -259,10 +252,7 @@ pub trait Database: Send + Sync {
     async fn save_sandbox_job(&self, job: &SandboxJobRecord) -> Result<(), DatabaseError>;
 
     /// Get a sandbox job by ID.
-    async fn get_sandbox_job(
-        &self,
-        id: Uuid,
-    ) -> Result<Option<SandboxJobRecord>, DatabaseError>;
+    async fn get_sandbox_job(&self, id: Uuid) -> Result<Option<SandboxJobRecord>, DatabaseError>;
 
     /// List all sandbox jobs, most recent first.
     async fn list_sandbox_jobs(&self) -> Result<Vec<SandboxJobRecord>, DatabaseError>;
@@ -304,17 +294,10 @@ pub trait Database: Send + Sync {
     ) -> Result<bool, DatabaseError>;
 
     /// Update sandbox job mode.
-    async fn update_sandbox_job_mode(
-        &self,
-        id: Uuid,
-        mode: &str,
-    ) -> Result<(), DatabaseError>;
+    async fn update_sandbox_job_mode(&self, id: Uuid, mode: &str) -> Result<(), DatabaseError>;
 
     /// Get sandbox job mode.
-    async fn get_sandbox_job_mode(
-        &self,
-        id: Uuid,
-    ) -> Result<Option<String>, DatabaseError>;
+    async fn get_sandbox_job_mode(&self, id: Uuid) -> Result<Option<String>, DatabaseError>;
 
     // ==================== Job Events ====================
 
@@ -327,10 +310,7 @@ pub trait Database: Send + Sync {
     ) -> Result<(), DatabaseError>;
 
     /// Load all job events.
-    async fn list_job_events(
-        &self,
-        job_id: Uuid,
-    ) -> Result<Vec<JobEventRecord>, DatabaseError>;
+    async fn list_job_events(&self, job_id: Uuid) -> Result<Vec<JobEventRecord>, DatabaseError>;
 
     // ==================== Routines ====================
 
@@ -395,10 +375,7 @@ pub trait Database: Send + Sync {
     ) -> Result<Vec<RoutineRun>, DatabaseError>;
 
     /// Count currently running runs for a routine.
-    async fn count_running_routine_runs(
-        &self,
-        routine_id: Uuid,
-    ) -> Result<i64, DatabaseError>;
+    async fn count_running_routine_runs(&self, routine_id: Uuid) -> Result<i64, DatabaseError>;
 
     // ==================== Tool Failures ====================
 
@@ -410,10 +387,7 @@ pub trait Database: Send + Sync {
     ) -> Result<(), DatabaseError>;
 
     /// Get broken tools exceeding threshold.
-    async fn get_broken_tools(
-        &self,
-        threshold: i32,
-    ) -> Result<Vec<BrokenTool>, DatabaseError>;
+    async fn get_broken_tools(&self, threshold: i32) -> Result<Vec<BrokenTool>, DatabaseError>;
 
     /// Mark a tool as repaired.
     async fn mark_tool_repaired(&self, tool_name: &str) -> Result<(), DatabaseError>;
@@ -446,17 +420,10 @@ pub trait Database: Send + Sync {
     ) -> Result<(), DatabaseError>;
 
     /// Delete a single setting.
-    async fn delete_setting(
-        &self,
-        user_id: &str,
-        key: &str,
-    ) -> Result<bool, DatabaseError>;
+    async fn delete_setting(&self, user_id: &str, key: &str) -> Result<bool, DatabaseError>;
 
     /// List all settings for a user.
-    async fn list_settings(
-        &self,
-        user_id: &str,
-    ) -> Result<Vec<SettingRow>, DatabaseError>;
+    async fn list_settings(&self, user_id: &str) -> Result<Vec<SettingRow>, DatabaseError>;
 
     /// Get all settings as a flat map.
     async fn get_all_settings(

@@ -11,8 +11,8 @@ use deadpool_postgres::Pool;
 use rust_decimal::Decimal;
 use uuid::Uuid;
 
-use crate::agent::routine::{Routine, RoutineRun, RunStatus};
 use crate::agent::BrokenTool;
+use crate::agent::routine::{Routine, RoutineRun, RunStatus};
 use crate::config::DatabaseConfig;
 use crate::context::{ActionRecord, JobContext, JobState};
 use crate::db::Database;
@@ -65,7 +65,9 @@ impl Database for PgBackend {
         user_id: &str,
         thread_id: Option<&str>,
     ) -> Result<Uuid, DatabaseError> {
-        self.store.create_conversation(channel, user_id, thread_id).await
+        self.store
+            .create_conversation(channel, user_id, thread_id)
+            .await
     }
 
     async fn touch_conversation(&self, id: Uuid) -> Result<(), DatabaseError> {
@@ -160,9 +162,7 @@ impl Database for PgBackend {
         &self,
         conversation_id: Uuid,
     ) -> Result<Vec<ConversationMessage>, DatabaseError> {
-        self.store
-            .list_conversation_messages(conversation_id)
-            .await
+        self.store.list_conversation_messages(conversation_id).await
     }
 
     async fn conversation_belongs_to_user(
@@ -191,7 +191,9 @@ impl Database for PgBackend {
         status: JobState,
         failure_reason: Option<&str>,
     ) -> Result<(), DatabaseError> {
-        self.store.update_job_status(id, status, failure_reason).await
+        self.store
+            .update_job_status(id, status, failure_reason)
+            .await
     }
 
     async fn mark_job_stuck(&self, id: Uuid) -> Result<(), DatabaseError> {
@@ -204,18 +206,11 @@ impl Database for PgBackend {
 
     // ==================== Actions ====================
 
-    async fn save_action(
-        &self,
-        job_id: Uuid,
-        action: &ActionRecord,
-    ) -> Result<(), DatabaseError> {
+    async fn save_action(&self, job_id: Uuid, action: &ActionRecord) -> Result<(), DatabaseError> {
         self.store.save_action(job_id, action).await
     }
 
-    async fn get_job_actions(
-        &self,
-        job_id: Uuid,
-    ) -> Result<Vec<ActionRecord>, DatabaseError> {
+    async fn get_job_actions(&self, job_id: Uuid) -> Result<Vec<ActionRecord>, DatabaseError> {
         self.store.get_job_actions(job_id).await
     }
 
@@ -266,10 +261,7 @@ impl Database for PgBackend {
         self.store.save_sandbox_job(job).await
     }
 
-    async fn get_sandbox_job(
-        &self,
-        id: Uuid,
-    ) -> Result<Option<SandboxJobRecord>, DatabaseError> {
+    async fn get_sandbox_job(&self, id: Uuid) -> Result<Option<SandboxJobRecord>, DatabaseError> {
         self.store.get_sandbox_job(id).await
     }
 
@@ -318,21 +310,16 @@ impl Database for PgBackend {
         job_id: Uuid,
         user_id: &str,
     ) -> Result<bool, DatabaseError> {
-        self.store.sandbox_job_belongs_to_user(job_id, user_id).await
+        self.store
+            .sandbox_job_belongs_to_user(job_id, user_id)
+            .await
     }
 
-    async fn update_sandbox_job_mode(
-        &self,
-        id: Uuid,
-        mode: &str,
-    ) -> Result<(), DatabaseError> {
+    async fn update_sandbox_job_mode(&self, id: Uuid, mode: &str) -> Result<(), DatabaseError> {
         self.store.update_sandbox_job_mode(id, mode).await
     }
 
-    async fn get_sandbox_job_mode(
-        &self,
-        id: Uuid,
-    ) -> Result<Option<String>, DatabaseError> {
+    async fn get_sandbox_job_mode(&self, id: Uuid) -> Result<Option<String>, DatabaseError> {
         self.store.get_sandbox_job_mode(id).await
     }
 
@@ -347,10 +334,7 @@ impl Database for PgBackend {
         self.store.save_job_event(job_id, event_type, data).await
     }
 
-    async fn list_job_events(
-        &self,
-        job_id: Uuid,
-    ) -> Result<Vec<JobEventRecord>, DatabaseError> {
+    async fn list_job_events(&self, job_id: Uuid) -> Result<Vec<JobEventRecord>, DatabaseError> {
         self.store.list_job_events(job_id).await
     }
 
@@ -439,10 +423,7 @@ impl Database for PgBackend {
         self.store.list_routine_runs(routine_id, limit).await
     }
 
-    async fn count_running_routine_runs(
-        &self,
-        routine_id: Uuid,
-    ) -> Result<i64, DatabaseError> {
+    async fn count_running_routine_runs(&self, routine_id: Uuid) -> Result<i64, DatabaseError> {
         self.store.count_running_routine_runs(routine_id).await
     }
 
@@ -453,13 +434,12 @@ impl Database for PgBackend {
         tool_name: &str,
         error_message: &str,
     ) -> Result<(), DatabaseError> {
-        self.store.record_tool_failure(tool_name, error_message).await
+        self.store
+            .record_tool_failure(tool_name, error_message)
+            .await
     }
 
-    async fn get_broken_tools(
-        &self,
-        threshold: i32,
-    ) -> Result<Vec<BrokenTool>, DatabaseError> {
+    async fn get_broken_tools(&self, threshold: i32) -> Result<Vec<BrokenTool>, DatabaseError> {
         self.store.get_broken_tools(threshold).await
     }
 
@@ -498,18 +478,11 @@ impl Database for PgBackend {
         self.store.set_setting(user_id, key, value).await
     }
 
-    async fn delete_setting(
-        &self,
-        user_id: &str,
-        key: &str,
-    ) -> Result<bool, DatabaseError> {
+    async fn delete_setting(&self, user_id: &str, key: &str) -> Result<bool, DatabaseError> {
         self.store.delete_setting(user_id, key).await
     }
 
-    async fn list_settings(
-        &self,
-        user_id: &str,
-    ) -> Result<Vec<SettingRow>, DatabaseError> {
+    async fn list_settings(&self, user_id: &str) -> Result<Vec<SettingRow>, DatabaseError> {
         self.store.list_settings(user_id).await
     }
 
@@ -540,7 +513,9 @@ impl Database for PgBackend {
         agent_id: Option<Uuid>,
         path: &str,
     ) -> Result<MemoryDocument, WorkspaceError> {
-        self.repo.get_document_by_path(user_id, agent_id, path).await
+        self.repo
+            .get_document_by_path(user_id, agent_id, path)
+            .await
     }
 
     async fn get_document_by_id(&self, id: Uuid) -> Result<MemoryDocument, WorkspaceError> {

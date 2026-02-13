@@ -74,7 +74,9 @@ pub async fn run_config_command(cmd: ConfigCommand) -> anyhow::Result<()> {
 
 /// Bootstrap a DB connection for config commands (backend-agnostic).
 async fn connect_db() -> anyhow::Result<Arc<dyn crate::db::Database>> {
-    let config = crate::config::Config::from_env().await.map_err(|e| anyhow::anyhow!("{}", e))?;
+    let config = crate::config::Config::from_env()
+        .await
+        .map_err(|e| anyhow::anyhow!("{}", e))?;
     crate::db::connect_from_config(&config.database)
         .await
         .map_err(|e| anyhow::anyhow!("{}", e))

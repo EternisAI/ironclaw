@@ -433,7 +433,9 @@ impl Workspace {
 
     /// List all files recursively (flat list of all paths).
     pub async fn list_all(&self) -> Result<Vec<String>, WorkspaceError> {
-        self.storage.list_all_paths(&self.user_id, self.agent_id).await
+        self.storage
+            .list_all_paths(&self.user_id, self.agent_id)
+            .await
     }
 
     // ==================== Convenience Methods ====================

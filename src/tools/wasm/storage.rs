@@ -643,7 +643,9 @@ impl WasmToolStore for LibSqlWasmToolStore {
             .next()
             .await
             .map_err(|e| WasmStorageError::Database(e.to_string()))?
-            .ok_or_else(|| WasmStorageError::Database("Insert succeeded but row not found".into()))?;
+            .ok_or_else(|| {
+                WasmStorageError::Database("Insert succeeded but row not found".into())
+            })?;
 
         libsql_row_to_tool(&row)
     }
