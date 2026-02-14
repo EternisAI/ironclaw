@@ -530,11 +530,6 @@ impl Settings {
         let mut settings = Self::default();
 
         for (key, value) in map {
-            // Check if this key maps to a known Settings field
-            if settings.get(key).is_none() {
-                continue;
-            }
-
             // Convert the JSONB value to a string for the existing set() method
             let value_str = match value {
                 serde_json::Value::String(s) => s.clone(),
@@ -544,13 +539,19 @@ impl Settings {
                 other => other.to_string(),
             };
 
-            if let Err(e) = settings.set(key, &value_str) {
-                tracing::warn!(
-                    "Failed to apply DB setting '{}' = '{}': {}",
-                    key,
-                    value_str,
-                    e
-                );
+            match settings.set(key, &value_str) {
+                Ok(()) => {}
+                // The settings table stores both Settings fields and app-specific
+                // data (e.g. nearai.session_token). Silently skip unknown paths.
+                Err(e) if e.starts_with("Path not found") => {}
+                Err(e) => {
+                    tracing::warn!(
+                        "Failed to apply DB setting '{}' = '{}': {}",
+                        key,
+                        value_str,
+                        e
+                    );
+                }
             }
         }
 

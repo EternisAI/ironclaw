@@ -190,7 +190,17 @@ impl DatabaseConfig {
                 message: e,
             })?
         } else if let Some(ref b) = settings.database_backend {
-            b.parse().unwrap_or(DatabaseBackend::default())
+            match b.parse() {
+                Ok(backend) => backend,
+                Err(e) => {
+                    tracing::warn!(
+                        "Invalid database_backend '{}' in settings: {}. Using default.",
+                        b,
+                        e
+                    );
+                    DatabaseBackend::default()
+                }
+            }
         } else {
             DatabaseBackend::default()
         };
@@ -418,7 +428,17 @@ impl LlmConfig {
                 message: e,
             })?
         } else if let Some(ref b) = settings.llm_backend {
-            b.parse().unwrap_or(LlmBackend::NearAi)
+            match b.parse() {
+                Ok(backend) => backend,
+                Err(e) => {
+                    tracing::warn!(
+                        "Invalid llm_backend '{}' in settings: {}. Using default NearAi.",
+                        b,
+                        e
+                    );
+                    LlmBackend::NearAi
+                }
+            }
         } else {
             LlmBackend::NearAi
         };
@@ -866,6 +886,13 @@ impl std::fmt::Debug for SecretsConfig {
     }
 }
 
+/// Process-wide cache for the keychain master key.
+///
+/// Avoids re-prompting the OS keychain on every `SecretsConfig::resolve()` call
+/// (e.g. `Config::from_env()` then `Config::from_db()`). Thread-safe alternative
+/// to caching in a process env var.
+static CACHED_KEYCHAIN_KEY: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
 impl SecretsConfig {
     async fn resolve(bootstrap: &crate::bootstrap::BootstrapConfig) -> Result<Self, ConfigError> {
         use crate::settings::KeySource;
@@ -875,21 +902,28 @@ impl SecretsConfig {
         } else {
             match bootstrap.secrets_master_key_source {
                 KeySource::Keychain => {
-                    // Try to load from OS keychain (async on Linux)
-                    match crate::secrets::keychain::get_master_key().await {
-                        Ok(key_bytes) => {
-                            let key_hex: String =
-                                key_bytes.iter().map(|b| format!("{:02x}", b)).collect();
-                            (Some(SecretString::from(key_hex)), KeySource::Keychain)
-                        }
-                        Err(_) => {
-                            // Keychain configured but key not found
-                            // This might happen if keychain was cleared
-                            tracing::warn!(
-                                "Secrets configured for keychain but key not found. \
-                                 Run 'ironclaw onboard' to reconfigure."
-                            );
-                            (None, KeySource::None)
+                    // Check process-level cache first (set on previous resolve() call)
+                    if let Some(cached) = CACHED_KEYCHAIN_KEY.get() {
+                        (
+                            Some(SecretString::from(cached.clone())),
+                            KeySource::Keychain,
+                        )
+                    } else {
+                        // Try to load from OS keychain (async on Linux)
+                        match crate::secrets::keychain::get_master_key().await {
+                            Ok(key_bytes) => {
+                                let key_hex: String =
+                                    key_bytes.iter().map(|b| format!("{b:02x}")).collect();
+                                let _ = CACHED_KEYCHAIN_KEY.set(key_hex.clone());
+                                (Some(SecretString::from(key_hex)), KeySource::Keychain)
+                            }
+                            Err(_) => {
+                                tracing::warn!(
+                                    "Secrets configured for keychain but key not found. \
+                                     Run 'ironclaw onboard' to reconfigure."
+                                );
+                                (None, KeySource::None)
+                            }
                         }
                     }
                 }
@@ -1386,7 +1420,9 @@ pub async fn inject_llm_keys_from_secrets(
         }
         match secrets.get_decrypted(user_id, secret_name).await {
             Ok(decrypted) => {
-                // SAFETY: single-threaded at this point in startup
+                // SAFETY: Called from main() before any tokio::spawn(). The tokio
+                // worker threads exist but are idle (no tasks scheduled yet), so
+                // no concurrent std::env::var reads can race with this write.
                 unsafe {
                     std::env::set_var(env_var, decrypted.expose());
                 }

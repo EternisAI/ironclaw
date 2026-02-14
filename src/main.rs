@@ -45,8 +45,6 @@ use ironclaw::secrets::PostgresSecretsStore;
 use ironclaw::secrets::SecretsCrypto;
 #[cfg(any(feature = "postgres", feature = "libsql"))]
 use ironclaw::setup::{SetupConfig, SetupWizard};
-use secrecy::ExposeSecret as _;
-
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
@@ -300,18 +298,8 @@ async fn main() -> anyhow::Result<()> {
         Err(e) => return Err(e.into()),
     };
 
-    // If the master key was loaded from the OS keychain, cache it in the process
-    // env so that later config re-resolution (Config::from_db) doesn't prompt
-    // the user for keychain access again.
-    if config.secrets.source == ironclaw::settings::KeySource::Keychain
-        && std::env::var("SECRETS_MASTER_KEY").is_err()
-        && let Some(key) = config.secrets.master_key()
-    {
-        // SAFETY: Single-threaded at this point in startup.
-        unsafe {
-            std::env::set_var("SECRETS_MASTER_KEY", key.expose_secret());
-        }
-    }
+    // Keychain master key caching is handled by CACHED_KEYCHAIN_KEY OnceLock
+    // in SecretsConfig::resolve(), so repeated resolve() calls skip the keychain.
 
     // Initialize session manager and authenticate before channel setup
     let session_config = SessionConfig {
