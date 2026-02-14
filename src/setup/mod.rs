@@ -24,7 +24,8 @@ mod prompts;
 mod wizard;
 
 pub use channels::{
-    SecretsContext, setup_http, setup_telegram, setup_tunnel, validate_telegram_token,
+    ChannelSetupError, SecretsContext, setup_http, setup_telegram, setup_tunnel,
+    validate_telegram_token,
 };
 pub use prompts::{
     confirm, input, optional_input, print_error, print_header, print_info, print_step,

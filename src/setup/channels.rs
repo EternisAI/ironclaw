@@ -20,6 +20,22 @@ use crate::setup::prompts::{
     confirm, input, optional_input, print_error, print_info, print_success, secret_input,
 };
 
+/// Typed errors for channel setup flows.
+#[derive(Debug, thiserror::Error)]
+pub enum ChannelSetupError {
+    #[error("I/O error: {0}")]
+    Io(#[from] std::io::Error),
+
+    #[error("{0}")]
+    Network(String),
+
+    #[error("{0}")]
+    Secrets(String),
+
+    #[error("{0}")]
+    Validation(String),
+}
+
 /// Context for saving secrets during setup.
 pub struct SecretsContext {
     store: Arc<dyn SecretsStore>,
@@ -45,32 +61,39 @@ impl SecretsContext {
     }
 
     /// Save a secret to the database.
-    pub async fn save_secret(&self, name: &str, value: &SecretString) -> Result<(), String> {
+    pub async fn save_secret(
+        &self,
+        name: &str,
+        value: &SecretString,
+    ) -> Result<(), ChannelSetupError> {
         let params = CreateSecretParams::new(name, value.expose_secret());
 
         self.store
             .create(&self.user_id, params)
             .await
-            .map_err(|e| format!("Failed to save secret: {}", e))?;
+            .map_err(|e| ChannelSetupError::Secrets(format!("Failed to save secret: {}", e)))?;
 
         Ok(())
     }
 
     /// Check if a secret exists.
     pub async fn secret_exists(&self, name: &str) -> bool {
-        self.store
-            .exists(&self.user_id, name)
-            .await
-            .unwrap_or(false)
+        match self.store.exists(&self.user_id, name).await {
+            Ok(exists) => exists,
+            Err(e) => {
+                tracing::warn!(secret = name, error = %e, "Failed to check if secret exists, assuming absent");
+                false
+            }
+        }
     }
 
     /// Read a secret from the database (decrypted).
-    pub async fn get_secret(&self, name: &str) -> Result<SecretString, String> {
+    pub async fn get_secret(&self, name: &str) -> Result<SecretString, ChannelSetupError> {
         let decrypted = self
             .store
             .get_decrypted(&self.user_id, name)
             .await
-            .map_err(|e| format!("Failed to read secret: {}", e))?;
+            .map_err(|e| ChannelSetupError::Secrets(format!("Failed to read secret: {}", e)))?;
         Ok(SecretString::from(decrypted.expose().to_string()))
     }
 }
@@ -130,7 +153,9 @@ struct TelegramUpdateUser {
 /// 2. Entering the bot token
 /// 3. Validating the token
 /// 4. Saving the token to the database
-pub async fn setup_telegram(secrets: &SecretsContext) -> Result<TelegramSetupResult, String> {
+pub async fn setup_telegram(
+    secrets: &SecretsContext,
+) -> Result<TelegramSetupResult, ChannelSetupError> {
     println!("Telegram Setup:");
     println!();
     print_info("To create a Telegram bot:");
@@ -142,7 +167,7 @@ pub async fn setup_telegram(secrets: &SecretsContext) -> Result<TelegramSetupRes
     // Check if token already exists
     if secrets.secret_exists("telegram_bot_token").await {
         print_info("Existing Telegram token found in database.");
-        if !confirm("Replace existing token?", false).map_err(|e| e.to_string())? {
+        if !confirm("Replace existing token?", false)? {
             // Still offer to configure webhook secret and owner binding
             let webhook_secret = setup_telegram_webhook_secret(secrets).await?;
             let owner_id = bind_telegram_owner_flow(secrets).await?;
@@ -155,47 +180,47 @@ pub async fn setup_telegram(secrets: &SecretsContext) -> Result<TelegramSetupRes
         }
     }
 
-    let token = secret_input("Bot token (from @BotFather)").map_err(|e| e.to_string())?;
+    loop {
+        let token = secret_input("Bot token (from @BotFather)")?;
 
-    // Validate the token
-    print_info("Validating bot token...");
+        // Validate the token
+        print_info("Validating bot token...");
 
-    match validate_telegram_token(&token).await {
-        Ok(username) => {
-            print_success(&format!(
-                "Bot validated: @{}",
-                username.as_deref().unwrap_or("unknown")
-            ));
+        match validate_telegram_token(&token).await {
+            Ok(username) => {
+                print_success(&format!(
+                    "Bot validated: @{}",
+                    username.as_deref().unwrap_or("unknown")
+                ));
 
-            // Save to database
-            secrets.save_secret("telegram_bot_token", &token).await?;
-            print_success("Token saved to database");
+                // Save to database
+                secrets.save_secret("telegram_bot_token", &token).await?;
+                print_success("Token saved to database");
 
-            // Bind bot to owner's Telegram account
-            let owner_id = bind_telegram_owner(&token).await?;
+                // Bind bot to owner's Telegram account
+                let owner_id = bind_telegram_owner(&token).await?;
 
-            // Offer webhook secret configuration
-            let webhook_secret = setup_telegram_webhook_secret(secrets).await?;
+                // Offer webhook secret configuration
+                let webhook_secret = setup_telegram_webhook_secret(secrets).await?;
 
-            Ok(TelegramSetupResult {
-                enabled: true,
-                bot_username: username,
-                webhook_secret,
-                owner_id,
-            })
-        }
-        Err(e) => {
-            print_error(&format!("Token validation failed: {}", e));
+                return Ok(TelegramSetupResult {
+                    enabled: true,
+                    bot_username: username,
+                    webhook_secret,
+                    owner_id,
+                });
+            }
+            Err(e) => {
+                print_error(&format!("Token validation failed: {}", e));
 
-            if confirm("Try again?", true).map_err(|e| e.to_string())? {
-                Box::pin(setup_telegram(secrets)).await
-            } else {
-                Ok(TelegramSetupResult {
-                    enabled: false,
-                    bot_username: None,
-                    webhook_secret: None,
-                    owner_id: None,
-                })
+                if !confirm("Try again?", true)? {
+                    return Ok(TelegramSetupResult {
+                        enabled: false,
+                        bot_username: None,
+                        webhook_secret: None,
+                        owner_id: None,
+                    });
+                }
             }
         }
     }
@@ -205,14 +230,14 @@ pub async fn setup_telegram(secrets: &SecretsContext) -> Result<TelegramSetupRes
 ///
 /// Polls `getUpdates` until a message arrives, then captures the sender's user ID.
 /// Returns `None` if the user declines or the flow times out.
-async fn bind_telegram_owner(token: &SecretString) -> Result<Option<i64>, String> {
+async fn bind_telegram_owner(token: &SecretString) -> Result<Option<i64>, ChannelSetupError> {
     println!();
     print_info("Account Binding (recommended):");
     print_info("Binding restricts the bot so only YOU can use it.");
     print_info("Without this, anyone who finds your bot can send it messages.");
     println!();
 
-    if !confirm("Bind bot to your Telegram account?", true).map_err(|e| e.to_string())? {
+    if !confirm("Bind bot to your Telegram account?", true)? {
         print_info("Skipping account binding. Bot will accept messages from all users.");
         return Ok(None);
     }
@@ -223,7 +248,7 @@ async fn bind_telegram_owner(token: &SecretString) -> Result<Option<i64>, String
     let client = Client::builder()
         .timeout(std::time::Duration::from_secs(35))
         .build()
-        .map_err(|e| format!("Failed to create HTTP client: {}", e))?;
+        .map_err(|e| ChannelSetupError::Network(format!("Failed to create HTTP client: {}", e)))?;
 
     // Clear any existing webhook so getUpdates works
     let delete_url = format!(
@@ -247,19 +272,23 @@ async fn bind_telegram_owner(token: &SecretString) -> Result<Option<i64>, String
             .query(&[("timeout", "30"), ("allowed_updates", "[\"message\"]")])
             .send()
             .await
-            .map_err(|e| format!("getUpdates request failed: {}", e))?;
+            .map_err(|e| ChannelSetupError::Network(format!("getUpdates request failed: {}", e)))?;
 
         if !response.status().is_success() {
-            return Err(format!("getUpdates returned status {}", response.status()));
+            return Err(ChannelSetupError::Network(format!(
+                "getUpdates returned status {}",
+                response.status()
+            )));
         }
 
-        let body: TelegramGetUpdatesResponse = response
-            .json()
-            .await
-            .map_err(|e| format!("Failed to parse getUpdates response: {}", e))?;
+        let body: TelegramGetUpdatesResponse = response.json().await.map_err(|e| {
+            ChannelSetupError::Network(format!("Failed to parse getUpdates response: {}", e))
+        })?;
 
         if !body.ok {
-            return Err("Telegram API returned error for getUpdates".to_string());
+            return Err(ChannelSetupError::Network(
+                "Telegram API returned error for getUpdates".to_string(),
+            ));
         }
 
         // Find the first message with a sender
@@ -305,12 +334,14 @@ async fn bind_telegram_owner(token: &SecretString) -> Result<Option<i64>, String
 /// Bind flow when the token already exists (reads from secrets store).
 ///
 /// Retrieves the saved bot token and delegates to `bind_telegram_owner`.
-async fn bind_telegram_owner_flow(secrets: &SecretsContext) -> Result<Option<i64>, String> {
+async fn bind_telegram_owner_flow(
+    secrets: &SecretsContext,
+) -> Result<Option<i64>, ChannelSetupError> {
     // Check current settings first
     let settings = Settings::load();
     if settings.channels.telegram_owner_id.is_some() {
         print_info("Bot is already bound to a Telegram account.");
-        if !confirm("Re-bind to a different account?", false).map_err(|e| e.to_string())? {
+        if !confirm("Re-bind to a different account?", false)? {
             return Ok(settings.channels.telegram_owner_id);
         }
     }
@@ -325,12 +356,12 @@ async fn bind_telegram_owner_flow(secrets: &SecretsContext) -> Result<Option<i64
 ///
 /// This is shared across all channels that need webhook endpoints.
 /// Returns the tunnel URL if configured.
-pub fn setup_tunnel() -> Result<Option<String>, String> {
+pub fn setup_tunnel() -> Result<Option<String>, ChannelSetupError> {
     // Check if already configured
     let settings = Settings::load();
     if let Some(ref url) = settings.tunnel.public_url {
         print_info(&format!("Existing tunnel configured: {}", url));
-        if !confirm("Change tunnel configuration?", false).map_err(|e| e.to_string())? {
+        if !confirm("Change tunnel configuration?", false)? {
             return Ok(Some(url.clone()));
         }
     }
@@ -350,17 +381,18 @@ pub fn setup_tunnel() -> Result<Option<String>, String> {
     print_info("Security comes from provider-specific secrets (e.g., Telegram webhook secret).");
     println!();
 
-    if !confirm("Configure a tunnel?", false).map_err(|e| e.to_string())? {
+    if !confirm("Configure a tunnel?", false)? {
         return Ok(None);
     }
 
-    let tunnel_url =
-        input("Tunnel URL (e.g., https://abc123.ngrok.io)").map_err(|e| e.to_string())?;
+    let tunnel_url = input("Tunnel URL (e.g., https://abc123.ngrok.io)")?;
 
     // Validate URL format
     if !tunnel_url.starts_with("https://") {
         print_error("URL must start with https:// (webhooks require HTTPS)");
-        return Err("Invalid tunnel URL: must use HTTPS".to_string());
+        return Err(ChannelSetupError::Validation(
+            "Invalid tunnel URL: must use HTTPS".to_string(),
+        ));
     }
 
     // Remove trailing slash if present
@@ -369,9 +401,12 @@ pub fn setup_tunnel() -> Result<Option<String>, String> {
     // Save to settings
     let mut settings = Settings::load();
     settings.tunnel.public_url = Some(tunnel_url.clone());
-    settings
-        .save()
-        .map_err(|e| format!("Failed to save settings: {}", e))?;
+    settings.save().map_err(|e| {
+        ChannelSetupError::Io(std::io::Error::other(format!(
+            "Failed to save settings: {}",
+            e
+        )))
+    })?;
 
     print_success(&format!("Tunnel URL saved: {}", tunnel_url));
     print_info("");
@@ -384,7 +419,9 @@ pub fn setup_tunnel() -> Result<Option<String>, String> {
 /// Set up Telegram webhook secret for signature validation.
 ///
 /// Returns the webhook secret if configured.
-async fn setup_telegram_webhook_secret(secrets: &SecretsContext) -> Result<Option<String>, String> {
+async fn setup_telegram_webhook_secret(
+    secrets: &SecretsContext,
+) -> Result<Option<String>, ChannelSetupError> {
     // Check if tunnel is configured
     let settings = Settings::load();
     if settings.tunnel.public_url.is_none() {
@@ -399,7 +436,7 @@ async fn setup_telegram_webhook_secret(secrets: &SecretsContext) -> Result<Optio
     print_info("A webhook secret adds an extra layer of security by validating");
     print_info("that requests actually come from Telegram's servers.");
 
-    if !confirm("Generate a webhook secret?", true).map_err(|e| e.to_string())? {
+    if !confirm("Generate a webhook secret?", true)? {
         return Ok(None);
     }
 
@@ -418,11 +455,13 @@ async fn setup_telegram_webhook_secret(secrets: &SecretsContext) -> Result<Optio
 /// Validate a Telegram bot token by calling the getMe API.
 ///
 /// Returns the bot's username if valid.
-pub async fn validate_telegram_token(token: &SecretString) -> Result<Option<String>, String> {
+pub async fn validate_telegram_token(
+    token: &SecretString,
+) -> Result<Option<String>, ChannelSetupError> {
     let client = Client::builder()
         .timeout(std::time::Duration::from_secs(10))
         .build()
-        .map_err(|e| format!("Failed to create HTTP client: {}", e))?;
+        .map_err(|e| ChannelSetupError::Network(format!("Failed to create HTTP client: {}", e)))?;
 
     let url = format!(
         "https://api.telegram.org/bot{}/getMe",
@@ -433,21 +472,26 @@ pub async fn validate_telegram_token(token: &SecretString) -> Result<Option<Stri
         .get(&url)
         .send()
         .await
-        .map_err(|e| format!("Request failed: {}", e))?;
+        .map_err(|e| ChannelSetupError::Network(format!("Request failed: {}", e)))?;
 
     if !response.status().is_success() {
-        return Err(format!("API returned status {}", response.status()));
+        return Err(ChannelSetupError::Network(format!(
+            "API returned status {}",
+            response.status()
+        )));
     }
 
     let body: TelegramGetMeResponse = response
         .json()
         .await
-        .map_err(|e| format!("Failed to parse response: {}", e))?;
+        .map_err(|e| ChannelSetupError::Network(format!("Failed to parse response: {}", e)))?;
 
     if body.ok {
         Ok(body.result.and_then(|u| u.username))
     } else {
-        Err("Telegram API returned error".to_string())
+        Err(ChannelSetupError::Network(
+            "Telegram API returned error".to_string(),
+        ))
     }
 }
 
@@ -460,38 +504,34 @@ pub struct HttpSetupResult {
 }
 
 /// Set up HTTP webhook channel.
-pub async fn setup_http(secrets: &SecretsContext) -> Result<HttpSetupResult, String> {
+pub async fn setup_http(secrets: &SecretsContext) -> Result<HttpSetupResult, ChannelSetupError> {
     println!("HTTP Webhook Setup:");
     println!();
     print_info("The HTTP webhook allows external services to send messages to the agent.");
     println!();
 
-    let port_str = optional_input("Port", Some("default: 8080")).map_err(|e| e.to_string())?;
+    let port_str = optional_input("Port", Some("default: 8080"))?;
     let port: u16 = port_str
         .as_deref()
         .unwrap_or("8080")
         .parse()
-        .map_err(|e| format!("Invalid port: {}", e))?;
+        .map_err(|e| ChannelSetupError::Validation(format!("Invalid port: {}", e)))?;
 
     if port < 1024 {
         print_info("Note: Ports below 1024 may require root privileges");
     }
 
-    let host = optional_input("Host", Some("default: 0.0.0.0"))
-        .map_err(|e| e.to_string())?
-        .unwrap_or_else(|| "0.0.0.0".to_string());
+    let host =
+        optional_input("Host", Some("default: 0.0.0.0"))?.unwrap_or_else(|| "0.0.0.0".to_string());
 
     // Generate a webhook secret
-    if confirm("Generate a webhook secret for authentication?", true).map_err(|e| e.to_string())? {
+    if confirm("Generate a webhook secret for authentication?", true)? {
         let secret = generate_webhook_secret();
         secrets
-            .save_secret("http_webhook_secret", &SecretString::from(secret.clone()))
+            .save_secret("http_webhook_secret", &SecretString::from(secret))
             .await?;
         print_success("Webhook secret generated and saved to database");
-        print_info(&format!(
-            "Secret: {} (store this for your webhook clients)",
-            secret
-        ));
+        print_info("Retrieve it later with: ironclaw secret get http_webhook_secret");
     }
 
     print_success(&format!("HTTP webhook will listen on {}:{}", host, port));
@@ -505,11 +545,7 @@ pub async fn setup_http(secrets: &SecretsContext) -> Result<HttpSetupResult, Str
 
 /// Generate a random webhook secret.
 pub fn generate_webhook_secret() -> String {
-    use rand::RngCore;
-    let mut rng = rand::thread_rng();
-    let mut bytes = [0u8; 32];
-    rng.fill_bytes(&mut bytes);
-    bytes.iter().map(|b| format!("{:02x}", b)).collect()
+    generate_secret_with_length(32)
 }
 
 /// Result of WASM channel setup.
@@ -527,7 +563,7 @@ pub async fn setup_wasm_channel(
     secrets: &SecretsContext,
     channel_name: &str,
     setup: &crate::channels::wasm::SetupSchema,
-) -> Result<WasmChannelSetupResult, String> {
+) -> Result<WasmChannelSetupResult, ChannelSetupError> {
     println!("{} Setup:", channel_name);
     println!();
 
@@ -538,7 +574,7 @@ pub async fn setup_wasm_channel(
                 "Existing {} found in database.",
                 secret_config.name
             ));
-            if !confirm("Replace existing value?", false).map_err(|e| e.to_string())? {
+            if !confirm("Replace existing value?", false)? {
                 continue;
             }
         }
@@ -546,8 +582,7 @@ pub async fn setup_wasm_channel(
         // Get the value from user or auto-generate
         let value = if secret_config.optional {
             let input_value =
-                optional_input(&secret_config.prompt, Some("leave empty to auto-generate"))
-                    .map_err(|e| e.to_string())?;
+                optional_input(&secret_config.prompt, Some("leave empty to auto-generate"))?;
 
             if let Some(v) = input_value {
                 if !v.is_empty() {
@@ -574,18 +609,21 @@ pub async fn setup_wasm_channel(
             }
         } else {
             // Required secret
-            let input_value = secret_input(&secret_config.prompt).map_err(|e| e.to_string())?;
+            let input_value = secret_input(&secret_config.prompt)?;
 
             // Validate if pattern is provided
             if let Some(ref pattern) = secret_config.validation {
-                let re = regex::Regex::new(pattern)
-                    .map_err(|e| format!("Invalid validation pattern: {}", e))?;
+                let re = regex::Regex::new(pattern).map_err(|e| {
+                    ChannelSetupError::Validation(format!("Invalid validation pattern: {}", e))
+                })?;
                 if !re.is_match(input_value.expose_secret()) {
                     print_error(&format!(
                         "Value does not match expected format: {}",
                         pattern
                     ));
-                    return Err("Validation failed".to_string());
+                    return Err(ChannelSetupError::Validation(
+                        "Validation failed".to_string(),
+                    ));
                 }
             }
 
@@ -625,7 +663,7 @@ fn generate_secret_with_length(length: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::setup::channels::generate_webhook_secret;
 
     #[test]
     fn test_generate_webhook_secret() {
@@ -635,6 +673,8 @@ mod tests {
 
     #[test]
     fn test_generate_secret_with_length() {
+        use super::generate_secret_with_length;
+
         let s = generate_secret_with_length(16);
         assert_eq!(s.len(), 32); // 16 bytes = 32 hex chars
         assert!(s.chars().all(|c| c.is_ascii_hexdigit()));

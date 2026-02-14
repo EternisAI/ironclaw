@@ -54,6 +54,12 @@ pub enum SetupError {
     Cancelled,
 }
 
+impl From<crate::setup::channels::ChannelSetupError> for SetupError {
+    fn from(e: crate::setup::channels::ChannelSetupError) -> Self {
+        SetupError::Channel(e.to_string())
+    }
+}
+
 /// Setup wizard configuration.
 #[derive(Debug, Clone, Default)]
 pub struct SetupConfig {
@@ -363,7 +369,8 @@ impl SetupWizard {
                 print_error("Turso URL is required for cloud sync.");
                 (None, None)
             } else {
-                let token = input("Auth token").map_err(SetupError::Io)?;
+                let token_secret = secret_input("Auth token").map_err(SetupError::Io)?;
+                let token = token_secret.expose_secret().to_string();
                 if token.is_empty() {
                     print_error("Auth token is required for cloud sync.");
                     (None, None)
@@ -1201,7 +1208,7 @@ impl SetupWizard {
 
         // Discover available WASM channels
         let channels_dir = dirs::home_dir()
-            .unwrap_or_default()
+            .ok_or_else(|| SetupError::Config("Could not determine home directory".into()))?
             .join(".ironclaw/channels");
 
         let mut discovered_channels = discover_wasm_channels(&channels_dir).await;
@@ -1276,7 +1283,7 @@ impl SetupWizard {
         if selected.contains(&1) {
             println!();
             if let Some(ref ctx) = secrets {
-                let result = setup_http(ctx).await.map_err(SetupError::Channel)?;
+                let result = setup_http(ctx).await?;
                 self.settings.channels.http_enabled = result.enabled;
                 self.settings.channels.http_port = Some(result.port);
             } else {
@@ -1298,12 +1305,9 @@ impl SetupWizard {
             if let Some(ref ctx) = secrets {
                 let result = if let Some(cap_file) = discovered_by_name.get(&channel_name) {
                     if !cap_file.setup.required_secrets.is_empty() {
-                        setup_wasm_channel(ctx, &channel_name, &cap_file.setup)
-                            .await
-                            .map_err(SetupError::Channel)?
+                        setup_wasm_channel(ctx, &channel_name, &cap_file.setup).await?
                     } else if channel_name == "telegram" {
-                        let telegram_result =
-                            setup_telegram(ctx).await.map_err(SetupError::Channel)?;
+                        let telegram_result = setup_telegram(ctx).await?;
                         if let Some(owner_id) = telegram_result.owner_id {
                             self.settings.channels.telegram_owner_id = Some(owner_id);
                         }
@@ -1444,9 +1448,10 @@ impl SetupWizard {
         }
 
         if let Some(ref model) = self.settings.selected_model {
-            // Truncate long model names
-            let display = if model.len() > 40 {
-                format!("{}...", &model[..37])
+            // Truncate long model names (char-based to avoid UTF-8 panic)
+            let display = if model.chars().count() > 40 {
+                let truncated: String = model.chars().take(37).collect();
+                format!("{}...", truncated)
             } else {
                 model.clone()
             };
