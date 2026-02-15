@@ -9,7 +9,7 @@ use async_trait::async_trait;
 
 use crate::context::JobContext;
 use crate::extensions::{ExtensionKind, ExtensionManager};
-use crate::tools::tool::{Tool, ToolError, ToolOutput};
+use crate::tools::tool::{Tool, ToolError, ToolOutput, require_str};
 
 // ── tool_search ──────────────────────────────────────────────────────────
 
@@ -133,10 +133,7 @@ impl Tool for ToolInstallTool {
     ) -> Result<ToolOutput, ToolError> {
         let start = std::time::Instant::now();
 
-        let name = params
-            .get("name")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| ToolError::InvalidParameters("name is required".to_string()))?;
+        let name = require_str(&params, "name")?;
 
         let url = params.get("url").and_then(|v| v.as_str());
 
@@ -185,8 +182,9 @@ impl Tool for ToolAuthTool {
     }
 
     fn description(&self) -> &str {
-        "Authenticate an installed extension. For MCP servers, starts OAuth flow. \
-         For WASM tools with manual auth, returns instructions; call again with token param to complete."
+        "Initiate authentication for an extension. For OAuth, returns a URL. \
+         For manual auth, returns instructions. The user provides their token \
+         through a secure channel, never through this tool."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -196,10 +194,6 @@ impl Tool for ToolAuthTool {
                 "name": {
                     "type": "string",
                     "description": "Extension name to authenticate"
-                },
-                "token": {
-                    "type": "string",
-                    "description": "API token/key for manual auth (WASM tools). Provide after user gives you the token."
                 }
             },
             "required": ["name"]
@@ -213,16 +207,11 @@ impl Tool for ToolAuthTool {
     ) -> Result<ToolOutput, ToolError> {
         let start = std::time::Instant::now();
 
-        let name = params
-            .get("name")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| ToolError::InvalidParameters("name is required".to_string()))?;
-
-        let token = params.get("token").and_then(|v| v.as_str());
+        let name = require_str(&params, "name")?;
 
         let result = self
             .manager
-            .auth(name, token)
+            .auth(name, None)
             .await
             .map_err(|e| ToolError::ExecutionFailed(e.to_string()))?;
 
@@ -311,21 +300,55 @@ impl Tool for ToolActivateTool {
     ) -> Result<ToolOutput, ToolError> {
         let start = std::time::Instant::now();
 
-        let name = params
-            .get("name")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| ToolError::InvalidParameters("name is required".to_string()))?;
+        let name = require_str(&params, "name")?;
 
-        let result = self
-            .manager
-            .activate(name)
-            .await
-            .map_err(|e| ToolError::ExecutionFailed(e.to_string()))?;
+        match self.manager.activate(name).await {
+            Ok(result) => {
+                let output = serde_json::to_value(&result)
+                    .unwrap_or_else(|_| serde_json::json!({"error": "serialization failed"}));
+                Ok(ToolOutput::success(output, start.elapsed()))
+            }
+            Err(activate_err) => {
+                let err_str = activate_err.to_string();
+                let needs_auth = err_str.contains("authentication")
+                    || err_str.contains("401")
+                    || err_str.contains("Unauthorized")
+                    || err_str.contains("not authenticated");
 
-        let output = serde_json::to_value(&result)
-            .unwrap_or_else(|_| serde_json::json!({"error": "serialization failed"}));
+                if !needs_auth {
+                    return Err(ToolError::ExecutionFailed(err_str));
+                }
 
-        Ok(ToolOutput::success(output, start.elapsed()))
+                // Activation failed due to missing auth; initiate auth flow
+                // so the agent loop can show the auth card.
+                match self.manager.auth(name, None).await {
+                    Ok(auth_result) if auth_result.status == "authenticated" => {
+                        // Auth succeeded (e.g. env var was set); retry activation.
+                        let result = self
+                            .manager
+                            .activate(name)
+                            .await
+                            .map_err(|e| ToolError::ExecutionFailed(e.to_string()))?;
+                        let output = serde_json::to_value(&result).unwrap_or_else(
+                            |_| serde_json::json!({"error": "serialization failed"}),
+                        );
+                        Ok(ToolOutput::success(output, start.elapsed()))
+                    }
+                    Ok(auth_result) => {
+                        // Auth needs user input (awaiting_token). Return the auth
+                        // result so detect_auth_awaiting picks it up.
+                        let output = serde_json::to_value(&auth_result).unwrap_or_else(
+                            |_| serde_json::json!({"error": "serialization failed"}),
+                        );
+                        Ok(ToolOutput::success(output, start.elapsed()))
+                    }
+                    Err(auth_err) => Err(ToolError::ExecutionFailed(format!(
+                        "Activation failed ({}), and authentication also failed: {}",
+                        err_str, auth_err
+                    ))),
+                }
+            }
+        }
     }
 }
 
@@ -439,10 +462,7 @@ impl Tool for ToolRemoveTool {
     ) -> Result<ToolOutput, ToolError> {
         let start = std::time::Instant::now();
 
-        let name = params
-            .get("name")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| ToolError::InvalidParameters("name is required".to_string()))?;
+        let name = require_str(&params, "name")?;
 
         let message = self
             .manager
@@ -499,7 +519,11 @@ mod tests {
         assert!(tool.requires_approval());
         let schema = tool.parameters_schema();
         assert!(schema["properties"].get("name").is_some());
-        assert!(schema["properties"].get("token").is_some());
+        // token param must NOT be in schema (security: tokens never go through LLM)
+        assert!(
+            schema["properties"].get("token").is_none(),
+            "tool_auth must not have a token parameter"
+        );
     }
 
     #[test]
@@ -550,6 +574,7 @@ mod tests {
             std::path::PathBuf::from("/tmp/ironclaw-test-channels"),
             None,
             "test".to_string(),
+            None,
         ))
     }
 }

@@ -17,8 +17,14 @@ use std::sync::Arc;
 use async_trait::async_trait;
 
 use crate::context::JobContext;
-use crate::tools::tool::{Tool, ToolError, ToolOutput};
+use crate::tools::tool::{Tool, ToolError, ToolOutput, require_str};
 use crate::workspace::{Workspace, paths};
+
+/// Identity files that the LLM must not overwrite via tool calls.
+/// These are loaded into the system prompt and could be used for prompt
+/// injection if an attacker tricks the agent into overwriting them.
+const PROTECTED_IDENTITY_FILES: &[&str] =
+    &[paths::IDENTITY, paths::SOUL, paths::AGENTS, paths::USER];
 
 /// Tool for searching workspace memory.
 ///
@@ -75,10 +81,7 @@ impl Tool for MemorySearchTool {
     ) -> Result<ToolOutput, ToolError> {
         let start = std::time::Instant::now();
 
-        let query = params
-            .get("query")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| ToolError::InvalidParameters("missing 'query' parameter".to_string()))?;
+        let query = require_str(&params, "query")?;
 
         let limit = params
             .get("limit")
@@ -170,12 +173,7 @@ impl Tool for MemoryWriteTool {
     ) -> Result<ToolOutput, ToolError> {
         let start = std::time::Instant::now();
 
-        let content = params
-            .get("content")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| {
-                ToolError::InvalidParameters("missing 'content' parameter".to_string())
-            })?;
+        let content = require_str(&params, "content")?;
 
         if content.trim().is_empty() {
             return Err(ToolError::InvalidParameters(
@@ -187,6 +185,16 @@ impl Tool for MemoryWriteTool {
             .get("target")
             .and_then(|v| v.as_str())
             .unwrap_or("daily_log");
+
+        // Reject writes to identity files that are loaded into the system prompt.
+        // An attacker could use prompt injection to trick the agent into overwriting
+        // these, poisoning future conversations.
+        if PROTECTED_IDENTITY_FILES.contains(&target) {
+            return Err(ToolError::NotAuthorized(format!(
+                "writing to '{}' is not allowed (identity file protected from tool writes)",
+                target,
+            )));
+        }
 
         let append = params
             .get("append")
@@ -230,6 +238,20 @@ impl Tool for MemoryWriteTool {
                 paths::HEARTBEAT.to_string()
             }
             path => {
+                // Protect identity files from LLM overwrites (prompt injection defense).
+                // These files are injected into the system prompt, so poisoning them
+                // would let an attacker rewrite the agent's core instructions.
+                let normalized = path.trim_start_matches('/');
+                if PROTECTED_IDENTITY_FILES
+                    .iter()
+                    .any(|p| normalized.eq_ignore_ascii_case(p))
+                {
+                    return Err(ToolError::NotAuthorized(format!(
+                        "writing to '{}' is not allowed (identity file protected from tool access)",
+                        path
+                    )));
+                }
+
                 if append {
                     self.workspace
                         .append(path, content)
@@ -307,10 +329,7 @@ impl Tool for MemoryReadTool {
     ) -> Result<ToolOutput, ToolError> {
         let start = std::time::Instant::now();
 
-        let path = params
-            .get("path")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| ToolError::InvalidParameters("missing 'path' parameter".to_string()))?;
+        let path = require_str(&params, "path")?;
 
         let doc = self
             .workspace
@@ -452,7 +471,7 @@ impl Tool for MemoryTreeTool {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "postgres"))]
 mod tests {
     use super::*;
 

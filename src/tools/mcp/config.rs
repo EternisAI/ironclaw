@@ -88,8 +88,18 @@ impl McpServerConfig {
     }
 
     /// Check if this server requires authentication.
+    ///
+    /// Returns true if OAuth is pre-configured OR if this is a remote HTTPS server
+    /// (which likely supports Dynamic Client Registration even without pre-configured OAuth).
     pub fn requires_auth(&self) -> bool {
-        self.oauth.is_some()
+        if self.oauth.is_some() {
+            return true;
+        }
+        // Remote HTTPS servers need auth handling (DCR, token refresh, 401 detection).
+        // Localhost/127.0.0.1 servers are assumed to be dev servers without auth.
+        let url_lower = self.url.to_lowercase();
+        let is_localhost = is_localhost_url(&url_lower);
+        url_lower.starts_with("https://") && !is_localhost
     }
 
     /// Get the secret name used to store the access token.
@@ -327,10 +337,117 @@ pub async fn get_mcp_server(name: &str) -> Result<McpServerConfig, ConfigError> 
         })
 }
 
+// ==================== Database-backed MCP server config ====================
+
+/// Load MCP server configurations from the database settings table.
+///
+/// Falls back to the disk file if DB has no entry.
+pub async fn load_mcp_servers_from_db(
+    store: &dyn crate::db::Database,
+    user_id: &str,
+) -> Result<McpServersFile, ConfigError> {
+    match store.get_setting(user_id, "mcp_servers").await {
+        Ok(Some(value)) => {
+            let config: McpServersFile = serde_json::from_value(value)?;
+            Ok(config)
+        }
+        Ok(None) => {
+            // No entry in DB, fall back to disk
+            load_mcp_servers().await
+        }
+        Err(e) => {
+            tracing::warn!(
+                "Failed to load MCP servers from DB: {}, falling back to disk",
+                e
+            );
+            load_mcp_servers().await
+        }
+    }
+}
+
+/// Save MCP server configurations to the database settings table.
+pub async fn save_mcp_servers_to_db(
+    store: &dyn crate::db::Database,
+    user_id: &str,
+    config: &McpServersFile,
+) -> Result<(), ConfigError> {
+    let value = serde_json::to_value(config)?;
+    store
+        .set_setting(user_id, "mcp_servers", &value)
+        .await
+        .map_err(std::io::Error::other)?;
+    Ok(())
+}
+
+/// Add a new MCP server configuration (DB-backed).
+pub async fn add_mcp_server_db(
+    store: &dyn crate::db::Database,
+    user_id: &str,
+    config: McpServerConfig,
+) -> Result<(), ConfigError> {
+    config.validate()?;
+
+    let mut servers = load_mcp_servers_from_db(store, user_id).await?;
+    servers.upsert(config);
+    save_mcp_servers_to_db(store, user_id, &servers).await?;
+
+    Ok(())
+}
+
+/// Remove an MCP server by name (DB-backed).
+pub async fn remove_mcp_server_db(
+    store: &dyn crate::db::Database,
+    user_id: &str,
+    name: &str,
+) -> Result<(), ConfigError> {
+    let mut servers = load_mcp_servers_from_db(store, user_id).await?;
+
+    if !servers.remove(name) {
+        return Err(ConfigError::ServerNotFound {
+            name: name.to_string(),
+        });
+    }
+
+    save_mcp_servers_to_db(store, user_id, &servers).await?;
+    Ok(())
+}
+
+/// Check if a URL points to a loopback address (localhost, 127.0.0.1, [::1]).
+///
+/// Uses `url::Url` for proper parsing so edge cases (IPv6, userinfo, ports)
+/// are handled correctly without manual string splitting.
+fn is_localhost_url(url: &str) -> bool {
+    let Ok(parsed) = url::Url::parse(url) else {
+        return false;
+    };
+    match parsed.host() {
+        Some(url::Host::Domain(d)) => d.eq_ignore_ascii_case("localhost"),
+        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+        None => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn test_is_localhost_url() {
+        assert!(is_localhost_url("http://localhost:3000/path"));
+        assert!(is_localhost_url("https://localhost/path"));
+        assert!(is_localhost_url("http://127.0.0.1:8080"));
+        assert!(is_localhost_url("http://127.0.0.1"));
+        assert!(!is_localhost_url("https://notlocalhost.com/path"));
+        assert!(!is_localhost_url("https://example-localhost.io"));
+        assert!(!is_localhost_url("https://mcp.notion.com"));
+        assert!(is_localhost_url("http://user:pass@localhost:3000/path"));
+        // IPv6 loopback
+        assert!(is_localhost_url("http://[::1]:8080/path"));
+        assert!(is_localhost_url("http://[::1]/path"));
+        assert!(!is_localhost_url("http://[::2]:8080/path"));
+    }
 
     #[test]
     fn test_server_config_validation() {
@@ -438,5 +555,44 @@ mod tests {
             config.refresh_token_secret_name(),
             "mcp_notion_refresh_token"
         );
+    }
+
+    #[test]
+    fn test_requires_auth_with_oauth() {
+        let config = McpServerConfig::new("notion", "https://mcp.notion.com")
+            .with_oauth(OAuthConfig::new("client-123"));
+        assert!(config.requires_auth());
+    }
+
+    #[test]
+    fn test_requires_auth_remote_https_without_oauth() {
+        // Remote HTTPS servers need auth even without pre-configured OAuth (DCR)
+        let config = McpServerConfig::new("github-copilot", "https://api.githubcopilot.com/mcp/");
+        assert!(config.requires_auth());
+
+        let config = McpServerConfig::new("notion", "https://mcp.notion.com");
+        assert!(config.requires_auth());
+    }
+
+    #[test]
+    fn test_requires_auth_localhost_no_auth() {
+        // Localhost servers are dev servers, no auth needed
+        let config = McpServerConfig::new("local", "http://localhost:8080");
+        assert!(!config.requires_auth());
+
+        let config = McpServerConfig::new("local", "http://127.0.0.1:3000/mcp");
+        assert!(!config.requires_auth());
+
+        // Even HTTPS localhost doesn't require auth
+        let config = McpServerConfig::new("local", "https://localhost:8443");
+        assert!(!config.requires_auth());
+    }
+
+    #[test]
+    fn test_requires_auth_http_remote_no_auth() {
+        // HTTP remote servers won't pass validation, but if they existed
+        // they wouldn't trigger HTTPS auth detection
+        let config = McpServerConfig::new("bad", "http://mcp.example.com");
+        assert!(!config.requires_auth());
     }
 }

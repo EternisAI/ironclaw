@@ -17,24 +17,37 @@ use ironclaw::{
         web::log_layer::{LogBroadcaster, WebLogLayer},
     },
     cli::{
-        Cli, Command, run_mcp_command, run_memory_command, run_status_command, run_tool_command,
+        Cli, Command, run_mcp_command, run_pairing_command, run_status_command, run_tool_command,
     },
     config::Config,
     context::ContextManager,
     extensions::ExtensionManager,
-    history::Store,
-    llm::{SessionConfig, create_llm_provider, create_session_manager},
+    llm::{
+        FailoverProvider, LlmProvider, SessionConfig, create_llm_provider,
+        create_llm_provider_with_config, create_session_manager,
+    },
+    orchestrator::{
+        ContainerJobConfig, ContainerJobManager, OrchestratorApi, TokenStore,
+        api::OrchestratorState,
+    },
+    pairing::PairingStore,
     safety::SafetyLayer,
-    secrets::{PostgresSecretsStore, SecretsCrypto, SecretsStore},
-    settings::Settings,
-    setup::{SetupConfig, SetupWizard},
+    secrets::SecretsStore,
     tools::{
         ToolRegistry,
-        mcp::{McpClient, McpSessionManager, config::load_mcp_servers, is_authenticated},
-        wasm::{WasmToolLoader, WasmToolRuntime},
+        mcp::{McpClient, McpSessionManager, config::load_mcp_servers_from_db, is_authenticated},
+        wasm::{WasmToolLoader, WasmToolRuntime, load_dev_tools},
     },
     workspace::{EmbeddingProvider, NearAiEmbeddings, OpenAiEmbeddings, Workspace},
 };
+
+#[cfg(feature = "libsql")]
+use ironclaw::secrets::LibSqlSecretsStore;
+#[cfg(feature = "postgres")]
+use ironclaw::secrets::PostgresSecretsStore;
+use ironclaw::secrets::SecretsCrypto;
+#[cfg(any(feature = "postgres", feature = "libsql"))]
+use ironclaw::setup::{SetupConfig, SetupWizard};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -53,9 +66,14 @@ async fn main() -> anyhow::Result<()> {
             return run_tool_command(tool_cmd.clone()).await;
         }
         Some(Command::Config(config_cmd)) => {
-            // Config commands don't need logging setup
-            return ironclaw::cli::run_config_command(config_cmd.clone())
-                .map_err(|e| anyhow::anyhow!("{}", e));
+            // Config commands need DB access for settings
+            tracing_subscriber::fmt()
+                .with_env_filter(
+                    EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn")),
+                )
+                .init();
+
+            return ironclaw::cli::run_config_command(config_cmd.clone()).await;
         }
         Some(Command::Mcp(mcp_cmd)) => {
             // Simple logging for MCP commands
@@ -75,16 +93,14 @@ async fn main() -> anyhow::Result<()> {
                 .init();
 
             // Memory commands need database (and optionally embeddings)
-            let _ = dotenvy::dotenv();
-            let config = Config::from_env().map_err(|e| anyhow::anyhow!("{}", e))?;
-            let store = ironclaw::history::Store::new(&config.database).await?;
-            store.run_migrations().await?;
+            let config = Config::from_env()
+                .await
+                .map_err(|e| anyhow::anyhow!("{}", e))?;
 
             // Set up embeddings if available
             let session = ironclaw::llm::create_session_manager(ironclaw::llm::SessionConfig {
                 auth_base_url: config.llm.nearai.auth_base_url.clone(),
                 session_path: config.llm.nearai.session_path.clone(),
-                ..Default::default()
             })
             .await;
 
@@ -118,10 +134,25 @@ async fn main() -> anyhow::Result<()> {
                     None
                 };
 
-            return run_memory_command(mem_cmd.clone(), store.pool(), embeddings).await;
+            // Create a Database-trait-backed workspace for the memory command
+            let db: Arc<dyn ironclaw::db::Database> =
+                ironclaw::db::connect_from_config(&config.database)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("{}", e))?;
+
+            return ironclaw::cli::run_memory_command_with_db(mem_cmd.clone(), db, embeddings)
+                .await;
+        }
+        Some(Command::Pairing(pairing_cmd)) => {
+            tracing_subscriber::fmt()
+                .with_env_filter(
+                    EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn")),
+                )
+                .init();
+
+            return run_pairing_command(pairing_cmd.clone()).map_err(|e| anyhow::anyhow!("{}", e));
         }
         Some(Command::Status) => {
-            let _ = dotenvy::dotenv();
             tracing_subscriber::fmt()
                 .with_env_filter(
                     EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn")),
@@ -130,19 +161,107 @@ async fn main() -> anyhow::Result<()> {
 
             return run_status_command().await;
         }
+        Some(Command::Worker {
+            job_id,
+            orchestrator_url,
+            max_iterations,
+        }) => {
+            // Worker mode: runs inside a Docker container.
+            // Simple logging (no TUI, no DB, no channels).
+            tracing_subscriber::fmt()
+                .with_env_filter(
+                    EnvFilter::try_from_default_env()
+                        .unwrap_or_else(|_| EnvFilter::new("ironclaw=info")),
+                )
+                .init();
+
+            tracing::info!(
+                "Starting worker for job {} (orchestrator: {})",
+                job_id,
+                orchestrator_url
+            );
+
+            let config = ironclaw::worker::runtime::WorkerConfig {
+                job_id: *job_id,
+                orchestrator_url: orchestrator_url.clone(),
+                max_iterations: *max_iterations,
+                timeout: std::time::Duration::from_secs(600),
+            };
+
+            let runtime = ironclaw::worker::WorkerRuntime::new(config)
+                .map_err(|e| anyhow::anyhow!("Worker init failed: {}", e))?;
+
+            runtime
+                .run()
+                .await
+                .map_err(|e| anyhow::anyhow!("Worker failed: {}", e))?;
+
+            return Ok(());
+        }
+        Some(Command::ClaudeBridge {
+            job_id,
+            orchestrator_url,
+            max_turns,
+            model,
+        }) => {
+            // Claude Code bridge mode: runs inside a Docker container.
+            // Spawns the `claude` CLI and streams output to the orchestrator.
+            tracing_subscriber::fmt()
+                .with_env_filter(
+                    EnvFilter::try_from_default_env()
+                        .unwrap_or_else(|_| EnvFilter::new("ironclaw=info")),
+                )
+                .init();
+
+            tracing::info!(
+                "Starting Claude Code bridge for job {} (orchestrator: {}, model: {})",
+                job_id,
+                orchestrator_url,
+                model
+            );
+
+            let config = ironclaw::worker::claude_bridge::ClaudeBridgeConfig {
+                job_id: *job_id,
+                orchestrator_url: orchestrator_url.clone(),
+                max_turns: *max_turns,
+                model: model.clone(),
+                timeout: std::time::Duration::from_secs(1800),
+                allowed_tools: Vec::new(),
+            };
+
+            let runtime = ironclaw::worker::ClaudeBridgeRuntime::new(config)
+                .map_err(|e| anyhow::anyhow!("Claude bridge init failed: {}", e))?;
+
+            runtime
+                .run()
+                .await
+                .map_err(|e| anyhow::anyhow!("Claude bridge failed: {}", e))?;
+
+            return Ok(());
+        }
         Some(Command::Onboard {
             skip_auth,
             channels_only,
         }) => {
-            // Load .env before running onboarding wizard
+            // Load .env files before running onboarding wizard.
+            // Standard ./.env first (higher priority), then ~/.ironclaw/.env.
             let _ = dotenvy::dotenv();
+            ironclaw::bootstrap::load_ironclaw_env();
 
-            let config = SetupConfig {
-                skip_auth: *skip_auth,
-                channels_only: *channels_only,
-            };
-            let mut wizard = SetupWizard::with_config(config);
-            wizard.run().await?;
+            #[cfg(any(feature = "postgres", feature = "libsql"))]
+            {
+                let config = SetupConfig {
+                    skip_auth: *skip_auth,
+                    channels_only: *channels_only,
+                };
+                let mut wizard = SetupWizard::with_config(config);
+                wizard.run().await?;
+            }
+            #[cfg(not(any(feature = "postgres", feature = "libsql")))]
+            {
+                let _ = (skip_auth, channels_only);
+                eprintln!("Onboarding wizard requires the 'postgres' or 'libsql' feature.");
+            }
             return Ok(());
         }
         None | Some(Command::Run) => {
@@ -150,21 +269,25 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    // Load .env if present
+    // Load .env files early so DATABASE_URL (and any other vars) are
+    // available to all subsequent env-based config resolution.
+    // Standard ./.env first (higher priority), then ~/.ironclaw/.env.
     let _ = dotenvy::dotenv();
+    ironclaw::bootstrap::load_ironclaw_env();
 
     // Enhanced first-run detection
-    if !cli.no_onboard {
-        if let Some(reason) = check_onboard_needed() {
-            println!("Onboarding needed: {}", reason);
-            println!();
-            let mut wizard = SetupWizard::new();
-            wizard.run().await?;
-        }
+    #[cfg(any(feature = "postgres", feature = "libsql"))]
+    if !cli.no_onboard
+        && let Some(reason) = check_onboard_needed()
+    {
+        println!("Onboarding needed: {}", reason);
+        println!();
+        let mut wizard = SetupWizard::new();
+        wizard.run().await?;
     }
 
-    // Load configuration (after potential setup)
-    let config = match Config::from_env() {
+    // Load initial config from env + disk (before DB is available)
+    let mut config = match Config::from_env().await {
         Ok(c) => c,
         Err(ironclaw::error::ConfigError::MissingRequired { key, hint }) => {
             eprintln!("Configuration error: Missing required setting '{}'", key);
@@ -182,16 +305,17 @@ async fn main() -> anyhow::Result<()> {
     let session_config = SessionConfig {
         auth_base_url: config.llm.nearai.auth_base_url.clone(),
         session_path: config.llm.nearai.session_path.clone(),
-        ..Default::default()
     };
     let session = create_session_manager(session_config).await;
 
-    // Ensure we're authenticated before proceeding (may trigger login flow)
-    session.ensure_authenticated().await?;
+    // Ensure we're authenticated before proceeding (only needed for NEAR AI backend)
+    if config.llm.backend == ironclaw::config::LlmBackend::NearAi {
+        session.ensure_authenticated().await?;
+    }
 
     // Initialize tracing
     let env_filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("ironclaw=info,tower_http=debug"));
+        .unwrap_or_else(|_| EnvFilter::new("ironclaw=info,tower_http=warn"));
 
     // Create log broadcaster before tracing init so the WebLogLayer can capture all events.
     // This gets wired to the gateway's /api/logs/events SSE endpoint later.
@@ -199,7 +323,11 @@ async fn main() -> anyhow::Result<()> {
 
     tracing_subscriber::registry()
         .with(env_filter)
-        .with(tracing_subscriber::fmt::layer().with_target(false))
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_target(false)
+                .with_writer(ironclaw::tracing_fmt::TruncatingStderr::default()),
+        )
         .with(WebLogLayer::new(Arc::clone(&log_broadcaster)))
         .init();
 
@@ -214,22 +342,132 @@ async fn main() -> anyhow::Result<()> {
 
     tracing::info!("Starting IronClaw...");
     tracing::info!("Loaded configuration for agent: {}", config.agent.name);
-    tracing::info!("NEAR AI session authenticated");
+    tracing::info!("LLM backend: {}", config.llm.backend);
 
-    // Initialize database store (optional for testing)
-    let store = if cli.no_db {
+    // Initialize database backend.
+    //
+    // Creates an `Arc<dyn Database>` that all consumers share.
+    // Backend is selected by the `DATABASE_BACKEND` env var / config.
+    //
+    // NOTE: For simpler call sites (CLI commands, Memory handler) use the shared
+    // helper `ironclaw::db::connect_from_config()`. This block is kept inline
+    // because it also captures backend-specific handles (`pg_pool`, `libsql_db`)
+    // needed by the secrets store.
+    #[cfg(feature = "postgres")]
+    let mut pg_pool: Option<deadpool_postgres::Pool> = None;
+    #[cfg(feature = "libsql")]
+    let mut libsql_db: Option<std::sync::Arc<libsql::Database>> = None;
+
+    let db: Option<Arc<dyn ironclaw::db::Database>> = if cli.no_db {
         tracing::warn!("Running without database connection");
         None
     } else {
-        let store = Store::new(&config.database).await?;
-        store.run_migrations().await?;
-        tracing::info!("Database connected and migrations applied");
-        Some(Arc::new(store))
+        match config.database.backend {
+            #[cfg(feature = "libsql")]
+            ironclaw::config::DatabaseBackend::LibSql => {
+                use ironclaw::db::Database as _;
+                use ironclaw::db::libsql_backend::LibSqlBackend;
+                use secrecy::ExposeSecret as _;
+
+                let default_path = ironclaw::config::default_libsql_path();
+                let db_path = config
+                    .database
+                    .libsql_path
+                    .as_deref()
+                    .unwrap_or(&default_path);
+
+                let backend = if let Some(ref url) = config.database.libsql_url {
+                    let token = config.database.libsql_auth_token.as_ref().ok_or_else(|| {
+                        anyhow::anyhow!("LIBSQL_AUTH_TOKEN is required when LIBSQL_URL is set")
+                    })?;
+                    LibSqlBackend::new_remote_replica(db_path, url, token.expose_secret()).await?
+                } else {
+                    LibSqlBackend::new_local(db_path).await?
+                };
+                backend.run_migrations().await?;
+                tracing::info!("libSQL database connected and migrations applied");
+
+                // Capture the Database handle for SecretsStore (connection-per-op)
+                libsql_db = Some(backend.shared_db());
+
+                Some(Arc::new(backend) as Arc<dyn ironclaw::db::Database>)
+            }
+            #[cfg(feature = "postgres")]
+            _ => {
+                use ironclaw::db::Database as _;
+                let pg = ironclaw::db::postgres::PgBackend::new(&config.database)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("{}", e))?;
+                pg.run_migrations()
+                    .await
+                    .map_err(|e| anyhow::anyhow!("{}", e))?;
+                tracing::info!("PostgreSQL database connected and migrations applied");
+
+                pg_pool = Some(pg.pool());
+                Some(Arc::new(pg) as Arc<dyn ironclaw::db::Database>)
+            }
+            #[cfg(not(feature = "postgres"))]
+            _ => {
+                anyhow::bail!(
+                    "No database backend available. Enable 'postgres' or 'libsql' feature."
+                );
+            }
+        }
     };
 
+    // Post-init operations using the database
+    if let Some(ref db) = db {
+        // One-time migration: move disk config files into the DB settings table.
+        if let Err(e) = ironclaw::bootstrap::migrate_disk_to_db(db.as_ref(), "default").await {
+            tracing::warn!("Disk-to-DB settings migration failed: {}", e);
+        }
+
+        // Reload config from DB now that we have a connection.
+        match Config::from_db(db.as_ref(), "default").await {
+            Ok(db_config) => {
+                config = db_config;
+                tracing::info!("Configuration reloaded from database");
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "Failed to reload config from DB, keeping env-based config: {}",
+                    e
+                );
+            }
+        }
+
+        // Attach DB to session manager so tokens save to DB too
+        session.attach_store(Arc::clone(db), "default").await;
+
+        // Mark any jobs left in "running" or "creating" state as "interrupted".
+        if let Err(e) = db.cleanup_stale_sandbox_jobs().await {
+            tracing::warn!("Failed to cleanup stale sandbox jobs: {}", e);
+        }
+    }
     // Initialize LLM provider (clone session so we can reuse it for embeddings)
     let llm = create_llm_provider(&config.llm, session.clone())?;
     tracing::info!("LLM provider initialized: {}", llm.model_name());
+
+    // Wrap in failover if a fallback model is configured
+    let llm: Arc<dyn LlmProvider> =
+        if let Some(fallback_model) = config.llm.nearai.fallback_model.as_ref() {
+            if fallback_model == &config.llm.nearai.model {
+                tracing::warn!(
+                    "fallback_model is the same as primary model, failover may not be effective"
+                );
+            }
+            let mut fallback_config = config.llm.nearai.clone();
+            fallback_config.model = fallback_model.clone();
+            let fallback = create_llm_provider_with_config(&fallback_config, session.clone())?;
+            tracing::info!(
+                primary = %llm.model_name(),
+                fallback = %fallback.model_name(),
+                "LLM failover enabled"
+            );
+            Arc::new(FailoverProvider::new(vec![llm, fallback])?)
+        } else {
+            llm
+        };
 
     // Initialize safety layer
     let safety = Arc::new(SafetyLayer::new(&config.safety));
@@ -280,8 +518,8 @@ async fn main() -> anyhow::Result<()> {
     };
 
     // Register memory tools if database is available
-    if let Some(ref store) = store {
-        let mut workspace = Workspace::new("default", store.pool());
+    if let Some(ref db) = db {
+        let mut workspace = Workspace::new_with_db("default", Arc::clone(db));
         if let Some(ref emb) = embeddings {
             workspace = workspace.with_embeddings(emb.clone());
         }
@@ -289,8 +527,11 @@ async fn main() -> anyhow::Result<()> {
         tools.register_memory_tools(workspace);
     }
 
-    // Register builder tool if enabled
-    if config.builder.enabled {
+    // Register builder tool if enabled.
+    // When sandbox is enabled and allow_local_tools is false, skip builder registration
+    // because register_builder_tool also registers dev tools (shell, file ops) that would
+    // bypass the sandbox. The builder runs inside containers instead.
+    if config.builder.enabled && (config.agent.allow_local_tools || !config.sandbox.enabled) {
         tools
             .register_builder_tool(
                 llm.clone(),
@@ -301,20 +542,46 @@ async fn main() -> anyhow::Result<()> {
         tracing::info!("Builder mode enabled");
     }
 
-    // Create secrets store if master key is configured (needed for MCP auth and WASM channels)
+    // Create secrets store if master key is configured (needed for MCP auth and WASM channels).
+    //
+    // When both `postgres` and `libsql` features are compiled, the runtime-selected
+    // backend determines which store is created: whichever DB init branch ran will
+    // have set its handle (pg_pool or libsql_db), and the or_else chain picks it up.
     let secrets_store: Option<Arc<dyn SecretsStore + Send + Sync>> =
-        if let (Some(store), Some(master_key)) = (&store, config.secrets.master_key()) {
+        if let Some(master_key) = config.secrets.master_key() {
             match SecretsCrypto::new(master_key.clone()) {
-                Ok(crypto) => Some(Arc::new(PostgresSecretsStore::new(
-                    store.pool(),
-                    Arc::new(crypto),
-                ))),
+                Ok(crypto) => {
+                    let crypto = Arc::new(crypto);
+                    let store: Option<Arc<dyn SecretsStore + Send + Sync>> = None;
+
+                    #[cfg(feature = "libsql")]
+                    let store = store.or_else(|| {
+                        libsql_db.take().map(|db| {
+                            Arc::new(LibSqlSecretsStore::new(db, Arc::clone(&crypto)))
+                                as Arc<dyn SecretsStore + Send + Sync>
+                        })
+                    });
+
+                    #[cfg(feature = "postgres")]
+                    let store = store.or_else(|| {
+                        pg_pool.as_ref().map(|pool| {
+                            Arc::new(PostgresSecretsStore::new(pool.clone(), Arc::clone(&crypto)))
+                                as Arc<dyn SecretsStore + Send + Sync>
+                        })
+                    });
+
+                    store
+                }
                 Err(e) => {
                     tracing::warn!("Failed to initialize secrets crypto: {}", e);
+                    #[cfg(feature = "libsql")]
+                    let _ = libsql_db.take();
                     None
                 }
             }
         } else {
+            #[cfg(feature = "libsql")]
+            let _ = libsql_db.take();
             None
         };
 
@@ -338,7 +605,12 @@ async fn main() -> anyhow::Result<()> {
     // Both register into the shared ToolRegistry (RwLock-based) so concurrent writes are safe.
     let wasm_tools_future = async {
         if let Some(ref runtime) = wasm_tool_runtime {
-            let loader = WasmToolLoader::new(Arc::clone(runtime), Arc::clone(&tools));
+            let mut loader = WasmToolLoader::new(Arc::clone(runtime), Arc::clone(&tools));
+            if let Some(ref secrets) = secrets_store {
+                loader = loader.with_secrets_store(Arc::clone(secrets));
+            }
+
+            // Load installed tools from ~/.ironclaw/tools/
             match loader.load_from_dir(&config.wasm.tools_dir).await {
                 Ok(results) => {
                     if !results.loaded.is_empty() {
@@ -356,12 +628,32 @@ async fn main() -> anyhow::Result<()> {
                     tracing::warn!("Failed to scan WASM tools directory: {}", e);
                 }
             }
+
+            // Load dev tools from build artifacts (overrides installed if newer)
+            match load_dev_tools(&loader, &config.wasm.tools_dir).await {
+                Ok(results) => {
+                    if !results.loaded.is_empty() {
+                        tracing::info!(
+                            "Loaded {} dev WASM tools from build artifacts",
+                            results.loaded.len()
+                        );
+                    }
+                }
+                Err(e) => {
+                    tracing::debug!("No dev WASM tools found: {}", e);
+                }
+            }
         }
     };
 
     let mcp_servers_future = async {
         if let Some(ref secrets) = secrets_store {
-            match load_mcp_servers().await {
+            let servers_result = if let Some(ref d) = db {
+                load_mcp_servers_from_db(d.as_ref(), "default").await
+            } else {
+                ironclaw::tools::mcp::config::load_mcp_servers().await
+            };
+            match servers_result {
                 Ok(servers) => {
                     let enabled: Vec<_> = servers.enabled_servers().cloned().collect();
                     if !enabled.is_empty() {
@@ -470,6 +762,7 @@ async fn main() -> anyhow::Result<()> {
             config.channels.wasm_channels_dir.clone(),
             config.tunnel.public_url.clone(),
             "default".to_string(),
+            db.clone(),
         ));
         tools.register_extension_tools(Arc::clone(&manager));
         tracing::info!("Extension manager initialized with in-chat discovery tools");
@@ -479,6 +772,78 @@ async fn main() -> anyhow::Result<()> {
             "Extension manager not available (no secrets store). \
              Extension tools won't be registered."
         );
+        None
+    };
+
+    // Set up orchestrator for sandboxed job execution
+    // When allow_local_tools is false (default), the LLM uses create_job for FS/shell work.
+    // When allow_local_tools is true, dev tools are also registered directly (current behavior).
+    if config.agent.allow_local_tools {
+        tools.register_dev_tools();
+        tracing::info!(
+            "Local tools enabled (allow_local_tools=true), dev tools registered directly"
+        );
+    }
+
+    // Shared state for job events (used by both orchestrator and web gateway)
+    let job_event_tx: Option<
+        tokio::sync::broadcast::Sender<(uuid::Uuid, ironclaw::channels::web::types::SseEvent)>,
+    > = if config.sandbox.enabled {
+        let (tx, _) = tokio::sync::broadcast::channel(256);
+        Some(tx)
+    } else {
+        None
+    };
+    let prompt_queue = Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::<
+        uuid::Uuid,
+        std::collections::VecDeque<ironclaw::orchestrator::api::PendingPrompt>,
+    >::new()));
+
+    let container_job_manager: Option<Arc<ContainerJobManager>> = if config.sandbox.enabled {
+        let token_store = TokenStore::new();
+        let job_config = ContainerJobConfig {
+            image: config.sandbox.image.clone(),
+            memory_limit_mb: config.sandbox.memory_limit_mb,
+            cpu_shares: config.sandbox.cpu_shares,
+            orchestrator_port: 50051,
+            claude_config_dir: if config.claude_code.enabled {
+                Some(config.claude_code.config_dir.clone())
+            } else {
+                None
+            },
+            claude_code_model: config.claude_code.model.clone(),
+            claude_code_max_turns: config.claude_code.max_turns,
+            claude_code_memory_limit_mb: config.claude_code.memory_limit_mb,
+            claude_code_allowed_tools: config.claude_code.allowed_tools.clone(),
+        };
+        let jm = Arc::new(ContainerJobManager::new(job_config, token_store.clone()));
+
+        // Start the orchestrator internal API in the background
+        let orchestrator_state = OrchestratorState {
+            llm: llm.clone(),
+            job_manager: Arc::clone(&jm),
+            token_store,
+            job_event_tx: job_event_tx.clone(),
+            prompt_queue: Arc::clone(&prompt_queue),
+            store: db.clone(),
+        };
+
+        tokio::spawn(async move {
+            if let Err(e) = OrchestratorApi::start(orchestrator_state, 50051).await {
+                tracing::error!("Orchestrator API failed: {}", e);
+            }
+        });
+
+        tracing::info!("Orchestrator API started on :50051, sandbox delegation enabled");
+        if config.claude_code.enabled {
+            tracing::info!(
+                "Claude Code sandbox mode available (model: {}, max_turns: {})",
+                config.claude_code.model,
+                config.claude_code.max_turns
+            );
+        }
+        Some(jm)
+    } else {
         None
     };
 
@@ -507,7 +872,8 @@ async fn main() -> anyhow::Result<()> {
         match WasmChannelRuntime::new(WasmChannelRuntimeConfig::default()) {
             Ok(runtime) => {
                 let runtime = Arc::new(runtime);
-                let loader = WasmChannelLoader::new(Arc::clone(&runtime));
+                let pairing_store = Arc::new(PairingStore::new());
+                let loader = WasmChannelLoader::new(Arc::clone(&runtime), pairing_store);
 
                 match loader
                     .load_from_dir(&config.channels.wasm_channels_dir)
@@ -560,6 +926,17 @@ async fn main() -> anyhow::Result<()> {
                                     config_updates.insert(
                                         "webhook_secret".to_string(),
                                         serde_json::Value::String(secret.clone()),
+                                    );
+                                }
+
+                                // Inject owner_id for Telegram so the bot only responds
+                                // to the bound user account.
+                                if channel_name == "telegram"
+                                    && let Some(owner_id) = config.channels.telegram_owner_id
+                                {
+                                    config_updates.insert(
+                                        "owner_id".to_string(),
+                                        serde_json::json!(owner_id),
                                     );
                                 }
 
@@ -621,7 +998,7 @@ async fn main() -> anyhow::Result<()> {
                             channels.add(Box::new(SharedWasmChannel::new(channel_arc)));
                         }
 
-                        if has_webhook_channels && config.tunnel.public_url.is_some() {
+                        if has_webhook_channels {
                             webhook_routes.push(create_wasm_channel_router(
                                 wasm_router,
                                 extension_manager.as_ref().map(Arc::clone),
@@ -651,23 +1028,23 @@ async fn main() -> anyhow::Result<()> {
     // Extract its routes for the unified server; the channel itself just
     // provides the mpsc stream.
     let mut webhook_server_addr: Option<std::net::SocketAddr> = None;
-    if !cli.cli_only {
-        if let Some(ref http_config) = config.channels.http {
-            let http_channel = HttpChannel::new(http_config.clone());
-            webhook_routes.push(http_channel.routes());
-            let (host, port) = http_channel.addr();
-            webhook_server_addr = Some(
-                format!("{}:{}", host, port)
-                    .parse()
-                    .expect("HttpConfig host:port must be a valid SocketAddr"),
-            );
-            channels.add(Box::new(http_channel));
-            tracing::info!(
-                "HTTP channel enabled on {}:{}",
-                http_config.host,
-                http_config.port
-            );
-        }
+    if !cli.cli_only
+        && let Some(ref http_config) = config.channels.http
+    {
+        let http_channel = HttpChannel::new(http_config.clone());
+        webhook_routes.push(http_channel.routes());
+        let (host, port) = http_channel.addr();
+        webhook_server_addr = Some(
+            format!("{}:{}", host, port)
+                .parse()
+                .expect("HttpConfig host:port must be a valid SocketAddr"),
+        );
+        channels.add(Box::new(http_channel));
+        tracing::info!(
+            "HTTP channel enabled on {}:{}",
+            http_config.host,
+            http_config.port
+        );
     }
 
     // Start the unified webhook server if any routes were registered.
@@ -685,13 +1062,28 @@ async fn main() -> anyhow::Result<()> {
     };
 
     // Create workspace for agent (shared with memory tools)
-    let workspace = store.as_ref().map(|s| {
-        let mut ws = Workspace::new("default", s.pool());
+    let workspace = if let Some(ref db_ref) = db {
+        let mut ws = Workspace::new_with_db("default", Arc::clone(db_ref));
         if let Some(ref emb) = embeddings {
             ws = ws.with_embeddings(emb.clone());
         }
-        Arc::new(ws)
-    });
+        Some(Arc::new(ws))
+    } else {
+        None
+    };
+
+    // Seed workspace with core identity files on first boot
+    if let Some(ref ws) = workspace {
+        match ws.seed_if_empty().await {
+            Ok(count) if count > 0 => {
+                tracing::info!("Workspace seeded with {} core files", count);
+            }
+            Ok(_) => {}
+            Err(e) => {
+                tracing::warn!("Failed to seed workspace: {}", e);
+            }
+        }
+    }
 
     // Backfill embeddings if we just enabled the provider
     if let (Some(ws), Some(_)) = (&workspace, &embeddings) {
@@ -712,8 +1104,12 @@ async fn main() -> anyhow::Result<()> {
     // Create session manager (shared between agent and web gateway)
     let session_manager = Arc::new(SessionManager::new());
 
-    // Register job tools
-    tools.register_job_tools(Arc::clone(&context_manager));
+    // Register job tools (sandbox deps auto-injected when container_job_manager is available)
+    tools.register_job_tools(
+        Arc::clone(&context_manager),
+        container_job_manager.clone(),
+        db.clone(),
+    );
 
     // Add web gateway channel if configured
     if let Some(ref gw_config) = config.channels.gateway {
@@ -721,12 +1117,31 @@ async fn main() -> anyhow::Result<()> {
         if let Some(ref ws) = workspace {
             gw = gw.with_workspace(Arc::clone(ws));
         }
-        gw = gw.with_context_manager(Arc::clone(&context_manager));
         gw = gw.with_session_manager(Arc::clone(&session_manager));
         gw = gw.with_log_broadcaster(Arc::clone(&log_broadcaster));
         gw = gw.with_tool_registry(Arc::clone(&tools));
         if let Some(ref ext_mgr) = extension_manager {
             gw = gw.with_extension_manager(Arc::clone(ext_mgr));
+        }
+        if let Some(ref d) = db {
+            gw = gw.with_store(Arc::clone(d));
+        }
+        if let Some(ref jm) = container_job_manager {
+            gw = gw.with_job_manager(Arc::clone(jm));
+        }
+        if config.sandbox.enabled {
+            gw = gw.with_prompt_queue(Arc::clone(&prompt_queue));
+
+            // Spawn a task to forward job events from the broadcast channel to SSE
+            if let Some(ref tx) = job_event_tx {
+                let mut rx = tx.subscribe();
+                let gw_state = Arc::clone(gw.state());
+                tokio::spawn(async move {
+                    while let Ok((_job_id, event)) = rx.recv().await {
+                        gw_state.sse.broadcast(event);
+                    }
+                });
+            }
         }
 
         tracing::info!(
@@ -734,13 +1149,19 @@ async fn main() -> anyhow::Result<()> {
             gw_config.host,
             gw_config.port
         );
+        tracing::info!(
+            "Web UI: http://{}:{}/?token={}",
+            gw_config.host,
+            gw_config.port,
+            gw.auth_token()
+        );
 
         channels.add(Box::new(gw));
     }
 
     // Create and run the agent
     let deps = AgentDeps {
-        store,
+        store: db,
         llm,
         safety,
         tools,
@@ -752,6 +1173,7 @@ async fn main() -> anyhow::Result<()> {
         deps,
         channels,
         Some(config.heartbeat.clone()),
+        Some(config.routines.clone()),
         Some(context_manager),
         Some(session_manager),
     );
@@ -773,27 +1195,16 @@ async fn main() -> anyhow::Result<()> {
 /// Check if onboarding is needed and return the reason.
 ///
 /// Returns `Some(reason)` if onboarding should be triggered, `None` otherwise.
+/// Called after `load_ironclaw_env()`, so DATABASE_URL from `~/.ironclaw/.env`
+/// is already in the environment.
+#[cfg(any(feature = "postgres", feature = "libsql"))]
 fn check_onboard_needed() -> Option<&'static str> {
-    let settings = Settings::load();
+    let has_db = std::env::var("DATABASE_URL").is_ok()
+        || std::env::var("LIBSQL_PATH").is_ok()
+        || ironclaw::config::default_libsql_path().exists();
 
-    // Database not configured (and not in env)
-    if settings.database_url.is_none() && std::env::var("DATABASE_URL").is_err() {
+    if !has_db {
         return Some("Database not configured");
-    }
-
-    // Secrets not configured (and not in env)
-    if settings.secrets_master_key_source == ironclaw::settings::KeySource::None
-        && std::env::var("SECRETS_MASTER_KEY").is_err()
-        && !ironclaw::secrets::keychain::has_master_key()
-    {
-        // Only require secrets setup if user hasn't explicitly disabled it
-        // For now, we don't require it for first run
-    }
-
-    // First run (onboarding never completed and no session)
-    let session_path = ironclaw::llm::session::default_session_path();
-    if !settings.onboard_completed && !session_path.exists() {
-        return Some("First run");
     }
 
     None

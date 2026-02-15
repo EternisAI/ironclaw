@@ -30,7 +30,7 @@ use tokio::process::Command;
 
 use crate::context::JobContext;
 use crate::sandbox::{SandboxManager, SandboxPolicy};
-use crate::tools::tool::{Tool, ToolError, ToolOutput};
+use crate::tools::tool::{Tool, ToolDomain, ToolError, ToolOutput, require_str};
 
 /// Maximum output size before truncation (64KB).
 const MAX_OUTPUT_SIZE: usize = 64 * 1024;
@@ -73,6 +73,58 @@ static DANGEROUS_PATTERNS: LazyLock<Vec<&'static str>> = LazyLock::new(|| {
         "id_rsa",
     ]
 });
+
+/// Patterns that should NEVER be auto-approved, even if the user chose "always approve"
+/// for the shell tool. These require explicit per-invocation approval because they are
+/// destructive or security-sensitive.
+static NEVER_AUTO_APPROVE_PATTERNS: LazyLock<Vec<&'static str>> = LazyLock::new(|| {
+    vec![
+        "rm -rf",
+        "rm -fr",
+        "chmod -r 777",
+        "chmod 777",
+        "chown -r",
+        "shutdown",
+        "reboot",
+        "poweroff",
+        "init 0",
+        "init 6",
+        "iptables",
+        "nft ",
+        "useradd",
+        "userdel",
+        "passwd",
+        "visudo",
+        "crontab",
+        "systemctl disable",
+        "launchctl unload",
+        "kill -9",
+        "killall",
+        "pkill",
+        "docker rm",
+        "docker rmi",
+        "docker system prune",
+        "git push --force",
+        "git push -f",
+        "git reset --hard",
+        "git clean -f",
+        "DROP TABLE",
+        "DROP DATABASE",
+        "TRUNCATE",
+        "DELETE FROM",
+    ]
+});
+
+/// Check whether a shell command contains patterns that must never be auto-approved.
+///
+/// Even when the user has chosen "always approve" for the shell tool, these commands
+/// require explicit per-invocation approval because they are destructive.
+pub fn requires_explicit_approval(command: &str) -> bool {
+    let lower = command.to_lowercase();
+    NEVER_AUTO_APPROVE_PATTERNS
+        .iter()
+        .any(|p| lower.contains(&p.to_lowercase()))
+}
 
 /// Shell command execution tool.
 pub struct ShellTool {
@@ -289,23 +341,17 @@ impl ShellTool {
         // Determine timeout
         let timeout_duration = timeout.map(Duration::from_secs).unwrap_or(self.timeout);
 
-        // Try sandbox execution if available
-        if let Some(ref sandbox) = self.sandbox {
-            if sandbox.is_initialized() || sandbox.config().enabled {
-                match self
-                    .execute_sandboxed(sandbox, cmd, &cwd, timeout_duration)
-                    .await
-                {
-                    Ok((output, code)) => return Ok((output, code)),
-                    Err(e) => {
-                        // Log sandbox failure and fall through to direct execution
-                        tracing::warn!("Sandbox execution failed, falling back to direct: {}", e);
-                    }
-                }
-            }
+        // Use sandbox if configured; fail-closed (never silently fall through
+        // to unsandboxed execution when sandbox was intended).
+        if let Some(ref sandbox) = self.sandbox
+            && (sandbox.is_initialized() || sandbox.config().enabled)
+        {
+            return self
+                .execute_sandboxed(sandbox, cmd, &cwd, timeout_duration)
+                .await;
         }
 
-        // Fallback to direct execution
+        // Only execute directly when no sandbox was configured at all.
         let (output, code) = self.execute_direct(cmd, &cwd, timeout_duration).await?;
         Ok((output, code as i64))
     }
@@ -355,10 +401,7 @@ impl Tool for ShellTool {
         params: serde_json::Value,
         _ctx: &JobContext,
     ) -> Result<ToolOutput, ToolError> {
-        let command = params
-            .get("command")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| ToolError::InvalidParameters("missing 'command' parameter".into()))?;
+        let command = require_str(&params, "command")?;
 
         let workdir = params.get("workdir").and_then(|v| v.as_str());
         let timeout = params.get("timeout").and_then(|v| v.as_u64());
@@ -386,19 +429,25 @@ impl Tool for ShellTool {
     fn requires_sanitization(&self) -> bool {
         true // Shell output could contain anything
     }
+
+    fn domain(&self) -> ToolDomain {
+        ToolDomain::Container
+    }
 }
 
-/// Truncate output to fit within limits.
+/// Truncate output to fit within limits (UTF-8 safe).
 fn truncate_output(s: &str) -> String {
     if s.len() <= MAX_OUTPUT_SIZE {
         s.to_string()
     } else {
         let half = MAX_OUTPUT_SIZE / 2;
+        let head_end = crate::util::floor_char_boundary(s, half);
+        let tail_start = crate::util::floor_char_boundary(s, s.len() - half);
         format!(
             "{}\n\n... [truncated {} bytes] ...\n\n{}",
-            &s[..half],
+            &s[..head_end],
             s.len() - MAX_OUTPUT_SIZE,
-            &s[s.len() - half..]
+            &s[tail_start..]
         )
     }
 }
@@ -452,6 +501,69 @@ mod tests {
             .await;
 
         assert!(matches!(result, Err(ToolError::Timeout(_))));
+    }
+
+    #[test]
+    fn test_requires_explicit_approval() {
+        // Destructive commands should require explicit approval
+        assert!(requires_explicit_approval("rm -rf /tmp/stuff"));
+        assert!(requires_explicit_approval("git push --force origin main"));
+        assert!(requires_explicit_approval("git reset --hard HEAD~5"));
+        assert!(requires_explicit_approval("docker rm container_name"));
+        assert!(requires_explicit_approval("kill -9 12345"));
+        assert!(requires_explicit_approval("DROP TABLE users;"));
+
+        // Safe commands should not
+        assert!(!requires_explicit_approval("cargo build"));
+        assert!(!requires_explicit_approval("git status"));
+        assert!(!requires_explicit_approval("ls -la"));
+        assert!(!requires_explicit_approval("echo hello"));
+        assert!(!requires_explicit_approval("cat file.txt"));
+        assert!(!requires_explicit_approval(
+            "git push origin feature-branch"
+        ));
+    }
+
+    /// Replicate the extraction logic from agent_loop.rs to prove it works
+    /// when `arguments` is a `serde_json::Value::Object` (the common case
+    /// that was previously broken because `Value::Object.as_str()` returns None).
+    #[test]
+    fn test_destructive_command_extraction_from_object_args() {
+        let arguments = serde_json::json!({"command": "rm -rf /tmp/stuff"});
+
+        let cmd = arguments
+            .get("command")
+            .and_then(|c| c.as_str().map(String::from))
+            .or_else(|| {
+                arguments
+                    .as_str()
+                    .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
+                    .and_then(|v| v.get("command").and_then(|c| c.as_str().map(String::from)))
+            });
+
+        assert_eq!(cmd.as_deref(), Some("rm -rf /tmp/stuff"));
+        assert!(requires_explicit_approval(cmd.as_deref().unwrap()));
+    }
+
+    /// Verify extraction still works when `arguments` is a JSON string
+    /// (rare, but possible if the LLM provider returns string-encoded JSON).
+    #[test]
+    fn test_destructive_command_extraction_from_string_args() {
+        let arguments =
+            serde_json::Value::String(r#"{"command": "git push --force origin main"}"#.to_string());
+
+        let cmd = arguments
+            .get("command")
+            .and_then(|c| c.as_str().map(String::from))
+            .or_else(|| {
+                arguments
+                    .as_str()
+                    .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
+                    .and_then(|v| v.get("command").and_then(|c| c.as_str().map(String::from)))
+            });
+
+        assert_eq!(cmd.as_deref(), Some("git push --force origin main"));
+        assert!(requires_explicit_approval(cmd.as_deref().unwrap()));
     }
 
     #[test]

@@ -39,22 +39,29 @@
 //! - **Continuous learning** - Improve estimates from historical data
 
 pub mod agent;
+pub mod bootstrap;
 pub mod channels;
 pub mod cli;
 pub mod config;
 pub mod context;
+pub mod db;
 pub mod error;
 pub mod estimation;
 pub mod evaluation;
 pub mod extensions;
 pub mod history;
 pub mod llm;
+pub mod orchestrator;
+pub mod pairing;
 pub mod safety;
 pub mod sandbox;
 pub mod secrets;
 pub mod settings;
 pub mod setup;
 pub mod tools;
+pub mod tracing_fmt;
+pub mod util;
+pub mod worker;
 pub mod workspace;
 
 pub use config::Config;

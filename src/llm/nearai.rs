@@ -3,6 +3,7 @@
 //! This provider uses the NEAR AI chat-api which provides a unified interface
 //! to multiple LLM models (OpenAI, Anthropic, etc.) with user authentication.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -18,6 +19,7 @@ use crate::llm::provider::{
     ChatMessage, CompletionRequest, CompletionResponse, FinishReason, LlmProvider, Role, ToolCall,
     ToolCompletionRequest, ToolCompletionResponse,
 };
+use crate::llm::retry::{is_retryable_status, retry_backoff_delay};
 use crate::llm::session::SessionManager;
 
 /// Information about an available model from NEAR AI API.
@@ -31,11 +33,23 @@ pub struct ModelInfo {
     pub provider: Option<String>,
 }
 
+/// Per-thread chaining state: the last response ID and how many input
+/// messages were included in that request. This lets subsequent calls send
+/// only the delta (new messages since last call).
+struct ChainState {
+    response_id: String,
+    input_count: usize,
+}
+
 /// NEAR AI Chat API provider.
 pub struct NearAiProvider {
     client: Client,
     config: NearAiConfig,
     session: Arc<SessionManager>,
+    active_model: std::sync::RwLock<String>,
+    /// Per-thread response ID chaining state.
+    /// Key is thread_id from request metadata.
+    response_chains: std::sync::RwLock<HashMap<String, ChainState>>,
 }
 
 impl NearAiProvider {
@@ -46,11 +60,62 @@ impl NearAiProvider {
             .build()
             .unwrap_or_else(|_| Client::new());
 
+        let active_model = std::sync::RwLock::new(config.model.clone());
         Self {
             client,
             config,
             session,
+            active_model,
+            response_chains: std::sync::RwLock::new(HashMap::new()),
         }
+    }
+
+    /// Seed a response chain for a thread (e.g. when restoring from DB).
+    pub fn seed_response_id(&self, thread_id: &str, response_id: String) {
+        let mut chains = self
+            .response_chains
+            .write()
+            .expect("response_chains lock poisoned");
+        chains.insert(
+            thread_id.to_string(),
+            ChainState {
+                response_id,
+                input_count: 0,
+            },
+        );
+    }
+
+    /// Get the last response ID for a thread (for persistence).
+    pub fn get_response_id(&self, thread_id: &str) -> Option<String> {
+        let chains = self
+            .response_chains
+            .read()
+            .expect("response_chains lock poisoned");
+        chains.get(thread_id).map(|c| c.response_id.clone())
+    }
+
+    /// Store a response chain state after a successful call.
+    fn store_chain(&self, thread_id: &str, response_id: String, input_count: usize) {
+        let mut chains = self
+            .response_chains
+            .write()
+            .expect("response_chains lock poisoned");
+        chains.insert(
+            thread_id.to_string(),
+            ChainState {
+                response_id,
+                input_count,
+            },
+        );
+    }
+
+    /// Clear the chain for a thread (on error / fallback).
+    fn clear_chain(&self, thread_id: &str) {
+        let mut chains = self
+            .response_chains
+            .write()
+            .expect("response_chains lock poisoned");
+        chains.remove(thread_id);
     }
 
     fn api_url(&self, path: &str) -> String {
@@ -145,20 +210,20 @@ impl NearAiProvider {
             data: Option<Vec<ModelEntry>>,
         }
 
-        if let Ok(resp) = serde_json::from_str::<ModelsResponse>(&response_text) {
-            if let Some(entries) = resp.models.or(resp.data) {
-                let models: Vec<ModelInfo> = entries
-                    .into_iter()
-                    .filter_map(|e| {
-                        e.get_name().map(|name| ModelInfo {
-                            name,
-                            provider: None,
-                        })
+        if let Ok(resp) = serde_json::from_str::<ModelsResponse>(&response_text)
+            && let Some(entries) = resp.models.or(resp.data)
+        {
+            let models: Vec<ModelInfo> = entries
+                .into_iter()
+                .filter_map(|e| {
+                    e.get_name().map(|name| ModelInfo {
+                        name,
+                        provider: None,
                     })
-                    .collect();
-                if !models.is_empty() {
-                    return Ok(models);
-                }
+                })
+                .collect();
+            if !models.is_empty() {
+                return Ok(models);
             }
         }
 
@@ -206,103 +271,170 @@ impl NearAiProvider {
         }
     }
 
-    /// Inner request implementation without retry logic.
+    /// Inner request implementation with retry logic for transient errors.
+    ///
+    /// Retries on HTTP 429, 500, 502, 503, 504 with exponential backoff.
+    /// Does not retry on client errors (400, 401, 403, 404) or parse errors.
     async fn send_request_inner<T: Serialize + std::fmt::Debug, R: for<'de> Deserialize<'de>>(
         &self,
         path: &str,
         body: &T,
     ) -> Result<R, LlmError> {
         let url = self.api_url(path);
-        let token = self.session.get_token().await?;
+        let max_retries = self.config.max_retries;
 
-        tracing::debug!("Sending request to NEAR AI: {}", url);
-        tracing::debug!("Request body: {:?}", body);
+        for attempt in 0..=max_retries {
+            let token = self.session.get_token().await?;
 
-        let response = self
-            .client
-            .post(&url)
-            .header("Authorization", format!("Bearer {}", token.expose_secret()))
-            .header("Content-Type", "application/json")
-            .json(body)
-            .send()
-            .await
-            .map_err(|e| {
-                tracing::error!("NEAR AI request failed: {}", e);
-                e
-            })?;
+            tracing::debug!(
+                "Sending request to NEAR AI: {} (attempt {})",
+                url,
+                attempt + 1
+            );
+            tracing::debug!("Request body: {:?}", body);
 
-        let status = response.status();
-        let response_text = response.text().await.unwrap_or_default();
+            let response = self
+                .client
+                .post(&url)
+                .header("Authorization", format!("Bearer {}", token.expose_secret()))
+                .header("Content-Type", "application/json")
+                .json(body)
+                .send()
+                .await;
 
-        tracing::debug!("NEAR AI response status: {}", status);
-        tracing::debug!("NEAR AI response body: {}", response_text);
+            let response = match response {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::error!("NEAR AI request failed: {}", e);
+                    // Network errors (timeout, connection refused) are transient
+                    if attempt < max_retries {
+                        let delay = retry_backoff_delay(attempt);
+                        tracing::warn!(
+                            "NEAR AI request error (attempt {}/{}), retrying in {:?}: {}",
+                            attempt + 1,
+                            max_retries + 1,
+                            delay,
+                            e,
+                        );
+                        tokio::time::sleep(delay).await;
+                        continue;
+                    }
+                    return Err(e.into());
+                }
+            };
 
-        if !status.is_success() {
-            // Check for session expiration (401 with specific message patterns)
-            if status.as_u16() == 401 {
-                let is_session_expired = response_text.to_lowercase().contains("session")
-                    && (response_text.to_lowercase().contains("expired")
-                        || response_text.to_lowercase().contains("invalid"));
+            let status = response.status();
+            let response_text = response.text().await.unwrap_or_default();
 
-                if is_session_expired {
-                    return Err(LlmError::SessionExpired {
+            tracing::debug!("NEAR AI response status: {}", status);
+            tracing::debug!("NEAR AI response body: {}", response_text);
+
+            if !status.is_success() {
+                let status_code = status.as_u16();
+
+                // Check for session expiration (401 with specific message patterns)
+                if status_code == 401 {
+                    let lower = response_text.to_lowercase();
+                    let is_session_expired = lower.contains("session")
+                        && (lower.contains("expired") || lower.contains("invalid"));
+
+                    if is_session_expired {
+                        return Err(LlmError::SessionExpired {
+                            provider: "nearai".to_string(),
+                        });
+                    }
+
+                    // Generic 401 -- not retryable
+                    return Err(LlmError::AuthFailed {
                         provider: "nearai".to_string(),
                     });
                 }
 
-                // Generic 401 without session expiration indication
-                return Err(LlmError::AuthFailed {
-                    provider: "nearai".to_string(),
-                });
-            }
+                // Check if this is a transient error worth retrying
+                if is_retryable_status(status_code) && attempt < max_retries {
+                    let delay = retry_backoff_delay(attempt);
+                    tracing::warn!(
+                        "NEAR AI returned HTTP {} (attempt {}/{}), retrying in {:?}",
+                        status_code,
+                        attempt + 1,
+                        max_retries + 1,
+                        delay,
+                    );
+                    tokio::time::sleep(delay).await;
+                    continue;
+                }
 
-            // Try to parse as JSON error
-            if let Ok(error) = serde_json::from_str::<NearAiErrorResponse>(&response_text) {
-                if status.as_u16() == 429 {
-                    return Err(LlmError::RateLimited {
+                // Non-retryable error or exhausted retries
+                if let Ok(error) = serde_json::from_str::<NearAiErrorResponse>(&response_text) {
+                    if status_code == 429 {
+                        return Err(LlmError::RateLimited {
+                            provider: "nearai".to_string(),
+                            retry_after: None,
+                        });
+                    }
+                    return Err(LlmError::RequestFailed {
                         provider: "nearai".to_string(),
-                        retry_after: None,
+                        reason: error.error,
                     });
                 }
+
                 return Err(LlmError::RequestFailed {
                     provider: "nearai".to_string(),
-                    reason: error.error,
+                    reason: format!("HTTP {}: {}", status, response_text),
                 });
             }
 
-            return Err(LlmError::RequestFailed {
-                provider: "nearai".to_string(),
-                reason: format!("HTTP {}: {}", status, response_text),
-            });
+            // Success -- parse the response
+            return match serde_json::from_str::<R>(&response_text) {
+                Ok(parsed) => Ok(parsed),
+                Err(e) => {
+                    tracing::debug!("Response is not expected JSON format: {}", e);
+                    tracing::debug!("Will try alternative parsing in caller");
+                    Err(LlmError::InvalidResponse {
+                        provider: "nearai".to_string(),
+                        reason: format!("Parse error: {}. Raw: {}", e, response_text),
+                    })
+                }
+            };
         }
 
-        // Try to parse as our expected type
-        match serde_json::from_str::<R>(&response_text) {
-            Ok(parsed) => Ok(parsed),
-            Err(e) => {
-                tracing::debug!("Response is not expected JSON format: {}", e);
-                tracing::debug!("Will try alternative parsing in caller");
-                Err(LlmError::InvalidResponse {
-                    provider: "nearai".to_string(),
-                    reason: format!("Parse error: {}. Raw: {}", e, response_text),
-                })
-            }
-        }
+        // This is unreachable because the loop always returns, but the compiler
+        // cannot prove that. Return a generic error as a safety net.
+        Err(LlmError::RequestFailed {
+            provider: "nearai".to_string(),
+            reason: "retry loop exited unexpectedly".to_string(),
+        })
     }
 }
 
-/// Split messages into system instructions and non-system input messages.
+/// Split messages into system instructions and non-system input items.
 /// The OpenAI Responses API expects system prompts in an `instructions` field,
 /// not as a message with role "system" in the input array.
-fn split_messages(messages: Vec<ChatMessage>) -> (Option<String>, Vec<NearAiMessage>) {
+///
+/// When `chaining` is true, tool result messages (role=tool) are converted to
+/// `NearAiInputItem::FunctionCallOutput` for the Responses API protocol.
+fn split_messages(
+    messages: Vec<ChatMessage>,
+    chaining: bool,
+) -> (Option<String>, Vec<NearAiInputItem>) {
     let mut instructions: Vec<String> = Vec::new();
-    let mut input: Vec<NearAiMessage> = Vec::new();
+    let mut input: Vec<NearAiInputItem> = Vec::new();
 
     for msg in messages {
         if msg.role == Role::System {
             instructions.push(msg.content);
+        } else if chaining && msg.role == Role::Tool {
+            if let Some(ref call_id) = msg.tool_call_id {
+                input.push(NearAiInputItem::FunctionCallOutput {
+                    item_type: "function_call_output".to_string(),
+                    call_id: call_id.clone(),
+                    output: msg.content,
+                });
+            } else {
+                input.push(NearAiInputItem::Message(msg.into()));
+            }
         } else {
-            input.push(msg.into());
+            input.push(NearAiInputItem::Message(msg.into()));
         }
     }
 
@@ -318,12 +450,14 @@ fn split_messages(messages: Vec<ChatMessage>) -> (Option<String>, Vec<NearAiMess
 #[async_trait]
 impl LlmProvider for NearAiProvider {
     async fn complete(&self, req: CompletionRequest) -> Result<CompletionResponse, LlmError> {
-        let (instructions, input) = split_messages(req.messages);
+        let thread_id = req.metadata.get("thread_id").cloned();
+        let (instructions, input) = split_messages(req.messages, false);
 
         let request = NearAiRequest {
-            model: self.config.model.clone(),
+            model: self.active_model_name(),
             instructions,
             input,
+            previous_response_id: None,
             temperature: req.temperature,
             max_output_tokens: req.max_tokens,
             stream: Some(false),
@@ -350,6 +484,7 @@ impl LlmProvider for NearAiProvider {
                         finish_reason: FinishReason::Stop,
                         input_tokens: usage.input_tokens,
                         output_tokens: usage.output_tokens,
+                        response_id: None,
                     });
                 }
 
@@ -367,12 +502,13 @@ impl LlmProvider for NearAiProvider {
                     finish_reason: FinishReason::Stop,
                     input_tokens: 0,
                     output_tokens: 0,
+                    response_id: None,
                 });
             }
             Err(e) => return Err(e),
         };
 
-        tracing::debug!("NEAR AI response: {:?}", response);
+        tracing::debug!("NEAR AI response: output_items={}", response.output.len());
 
         // Extract text from response output
         // Try multiple formats since API response shape may vary
@@ -380,11 +516,6 @@ impl LlmProvider for NearAiProvider {
             .output
             .iter()
             .filter_map(|item| {
-                tracing::debug!(
-                    "Processing output item: type={}, text={:?}",
-                    item.item_type,
-                    item.text
-                );
                 if item.item_type == "message" {
                     // First check for direct text field on item
                     if let Some(ref text) = item.text {
@@ -395,11 +526,6 @@ impl LlmProvider for NearAiProvider {
                         contents
                             .iter()
                             .filter_map(|c| {
-                                tracing::debug!(
-                                    "Content item: type={}, text={:?}",
-                                    c.content_type,
-                                    c.text
-                                );
                                 // Accept various content types that might contain text
                                 match c.content_type.as_str() {
                                     "output_text" | "text" => c.text.clone(),
@@ -423,11 +549,17 @@ impl LlmProvider for NearAiProvider {
             );
         }
 
+        // Store response ID for chaining
+        if let Some(ref tid) = thread_id {
+            self.store_chain(tid, response.id.clone(), 0);
+        }
+
         Ok(CompletionResponse {
             content: text,
             finish_reason: FinishReason::Stop,
             input_tokens: response.usage.input_tokens,
             output_tokens: response.usage.output_tokens,
+            response_id: Some(response.id),
         })
     }
 
@@ -435,7 +567,33 @@ impl LlmProvider for NearAiProvider {
         &self,
         req: ToolCompletionRequest,
     ) -> Result<ToolCompletionResponse, LlmError> {
-        let (instructions, input) = split_messages(req.messages);
+        let thread_id = req.metadata.get("thread_id").cloned();
+
+        // Look up chaining state for this thread
+        let chain_state = thread_id.as_ref().and_then(|tid| {
+            let chains = self
+                .response_chains
+                .read()
+                .expect("response_chains lock poisoned");
+            chains
+                .get(tid)
+                .map(|c| (c.response_id.clone(), c.input_count))
+        });
+
+        let chaining = chain_state.is_some();
+        let (previous_response_id, prev_input_count) = chain_state
+            .map(|(rid, count)| (Some(rid), count))
+            .unwrap_or((None, 0));
+
+        // When chaining, only send new messages (the delta since last call).
+        // Tool results are converted to function_call_output items.
+        let (instructions, all_input) = split_messages(req.messages, chaining);
+        let input = if chaining && all_input.len() > prev_input_count {
+            all_input[prev_input_count..].to_vec()
+        } else {
+            all_input.clone()
+        };
+        let total_input_count = all_input.len();
 
         let tools: Vec<NearAiTool> = req
             .tools
@@ -449,18 +607,58 @@ impl LlmProvider for NearAiProvider {
             .collect();
 
         let request = NearAiRequest {
-            model: self.config.model.clone(),
-            instructions,
+            model: self.active_model_name(),
+            instructions: if chaining { None } else { instructions.clone() },
             input,
+            previous_response_id: previous_response_id.clone(),
             temperature: req.temperature,
             max_output_tokens: req.max_tokens,
             stream: Some(false),
-            tools: if tools.is_empty() { None } else { Some(tools) },
+            tools: if tools.is_empty() {
+                None
+            } else {
+                Some(tools.clone())
+            },
         };
 
-        // Try to get structured response, fall back to alternative formats
+        // Try to get structured response, fall back to alternative formats.
+        // If chaining fails (bad previous_response_id), retry with full history.
         let response: NearAiResponse = match self.send_request("responses", &request).await {
             Ok(r) => r,
+            Err(ref e) if chaining && is_chain_error(e) => {
+                tracing::warn!(
+                    "Response chaining failed, retrying with full history: {}",
+                    e
+                );
+                if let Some(ref tid) = thread_id {
+                    self.clear_chain(tid);
+                }
+                let (instructions_full, input_full) = split_messages(
+                    // Rebuild from the original input (non-chaining mode)
+                    {
+                        let mut msgs = Vec::new();
+                        if let Some(ref instr) = instructions {
+                            msgs.push(ChatMessage::system(instr.clone()));
+                        }
+                        for item in &all_input {
+                            msgs.push(item.to_chat_message());
+                        }
+                        msgs
+                    },
+                    false,
+                );
+                let retry_request = NearAiRequest {
+                    model: self.active_model_name(),
+                    instructions: instructions_full,
+                    input: input_full,
+                    previous_response_id: None,
+                    temperature: request.temperature,
+                    max_output_tokens: request.max_output_tokens,
+                    stream: Some(false),
+                    tools: request.tools.clone(),
+                };
+                self.send_request("responses", &retry_request).await?
+            }
             Err(LlmError::InvalidResponse { reason, .. }) if reason.contains("Raw: ") => {
                 let raw_text = reason.split("Raw: ").nth(1).unwrap_or("");
 
@@ -490,6 +688,7 @@ impl LlmProvider for NearAiProvider {
                         finish_reason,
                         input_tokens: usage.input_tokens,
                         output_tokens: usage.output_tokens,
+                        response_id: None,
                     });
                 }
 
@@ -507,6 +706,7 @@ impl LlmProvider for NearAiProvider {
                     finish_reason: FinishReason::Stop,
                     input_tokens: 0,
                     output_tokens: 0,
+                    response_id: None,
                 });
             }
             Err(e) => return Err(e),
@@ -536,21 +736,21 @@ impl LlmProvider for NearAiProvider {
                         }
                     }
                 }
-            } else if item.item_type == "function_call" {
-                if let (Some(name), Some(call_id)) = (&item.name, &item.call_id) {
-                    // Parse arguments JSON string into Value
-                    let arguments = item
-                        .arguments
-                        .as_ref()
-                        .and_then(|s| serde_json::from_str(s).ok())
-                        .unwrap_or(serde_json::Value::Object(Default::default()));
+            } else if item.item_type == "function_call"
+                && let (Some(name), Some(call_id)) = (&item.name, &item.call_id)
+            {
+                // Parse arguments JSON string into Value
+                let arguments = item
+                    .arguments
+                    .as_ref()
+                    .and_then(|s| serde_json::from_str(s).ok())
+                    .unwrap_or(serde_json::Value::Object(Default::default()));
 
-                    tool_calls.push(ToolCall {
-                        id: call_id.clone(),
-                        name: name.clone(),
-                        arguments,
-                    });
-                }
+                tool_calls.push(ToolCall {
+                    id: call_id.clone(),
+                    name: name.clone(),
+                    arguments,
+                });
             }
         }
 
@@ -560,12 +760,18 @@ impl LlmProvider for NearAiProvider {
             FinishReason::ToolUse
         };
 
+        // Store response ID for chaining on subsequent calls
+        if let Some(ref tid) = thread_id {
+            self.store_chain(tid, response.id.clone(), total_input_count);
+        }
+
         Ok(ToolCompletionResponse {
             content: if text.is_empty() { None } else { Some(text) },
             tool_calls,
             finish_reason,
             input_tokens: response.usage.input_tokens,
             output_tokens: response.usage.output_tokens,
+            response_id: Some(response.id),
         })
     }
 
@@ -584,6 +790,30 @@ impl LlmProvider for NearAiProvider {
         let models = NearAiProvider::list_models(self).await?;
         Ok(models.into_iter().map(|m| m.name).collect())
     }
+
+    fn active_model_name(&self) -> String {
+        self.active_model
+            .read()
+            .expect("active_model lock poisoned")
+            .clone()
+    }
+
+    fn set_model(&self, model: &str) -> Result<(), LlmError> {
+        let mut guard = self
+            .active_model
+            .write()
+            .expect("active_model lock poisoned");
+        *guard = model.to_string();
+        Ok(())
+    }
+
+    fn seed_response_chain(&self, thread_id: &str, response_id: String) {
+        self.seed_response_id(thread_id, response_id);
+    }
+
+    fn get_response_chain_id(&self, thread_id: &str) -> Option<String> {
+        self.get_response_id(thread_id)
+    }
 }
 
 // NEAR AI API types
@@ -597,8 +827,11 @@ struct NearAiRequest {
     /// System instructions (replaces sending system role in input)
     #[serde(skip_serializing_if = "Option::is_none")]
     instructions: Option<String>,
-    /// Input messages (user/assistant/tool only, NOT system)
-    input: Vec<NearAiMessage>,
+    /// Input items: messages and/or function_call_output entries.
+    input: Vec<NearAiInputItem>,
+    /// Chain this request to a previous response (avoids resending full context).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    previous_response_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     temperature: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -609,7 +842,7 @@ struct NearAiRequest {
     tools: Option<Vec<NearAiTool>>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 struct NearAiMessage {
     role: String,
     content: String,
@@ -630,7 +863,68 @@ impl From<ChatMessage> for NearAiMessage {
     }
 }
 
-#[derive(Debug, Serialize)]
+/// Input item for the Responses API. Either a regular message or a
+/// function_call_output (for returning tool results when chaining).
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(untagged)]
+enum NearAiInputItem {
+    Message(NearAiMessage),
+    FunctionCallOutput {
+        #[serde(rename = "type")]
+        item_type: String,
+        call_id: String,
+        output: String,
+    },
+}
+
+impl NearAiInputItem {
+    /// Convert back to a ChatMessage (used for fallback retry).
+    fn to_chat_message(&self) -> ChatMessage {
+        match self {
+            NearAiInputItem::Message(msg) => {
+                let role = match msg.role.as_str() {
+                    "system" => Role::System,
+                    "user" => Role::User,
+                    "assistant" => Role::Assistant,
+                    "tool" => Role::Tool,
+                    _ => Role::User,
+                };
+                ChatMessage {
+                    role,
+                    content: msg.content.clone(),
+                    tool_call_id: None,
+                    name: None,
+                    tool_calls: None,
+                }
+            }
+            NearAiInputItem::FunctionCallOutput {
+                call_id, output, ..
+            } => ChatMessage {
+                role: Role::Tool,
+                content: output.clone(),
+                tool_call_id: Some(call_id.clone()),
+                name: None,
+                tool_calls: None,
+            },
+        }
+    }
+}
+
+/// Check if an LLM error is likely caused by an invalid previous_response_id.
+fn is_chain_error(err: &LlmError) -> bool {
+    match err {
+        LlmError::RequestFailed { reason, .. } => {
+            let lower = reason.to_lowercase();
+            lower.contains("previous_response_id")
+                || lower.contains("previous response")
+                || lower.contains("not found")
+                || lower.contains("invalid response id")
+        }
+        _ => false,
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
 struct NearAiTool {
     #[serde(rename = "type")]
     tool_type: String,
@@ -833,14 +1127,17 @@ mod tests {
             ChatMessage::user("Hello"),
             ChatMessage::assistant("Hi there!"),
         ];
-        let (instructions, input) = split_messages(messages);
+        let (instructions, input) = split_messages(messages, false);
         assert_eq!(
             instructions,
             Some("You are a helpful assistant".to_string())
         );
         assert_eq!(input.len(), 2);
-        assert_eq!(input[0].role, "user");
-        assert_eq!(input[1].role, "assistant");
+        // Verify the input items are messages
+        match &input[0] {
+            NearAiInputItem::Message(m) => assert_eq!(m.role, "user"),
+            _ => panic!("expected Message"),
+        }
     }
 
     #[test]
@@ -849,7 +1146,7 @@ mod tests {
             ChatMessage::user("Hello"),
             ChatMessage::assistant("Hi there!"),
         ];
-        let (instructions, input) = split_messages(messages);
+        let (instructions, input) = split_messages(messages, false);
         assert!(instructions.is_none());
         assert_eq!(input.len(), 2);
     }
@@ -861,11 +1158,44 @@ mod tests {
             ChatMessage::system("Second instruction"),
             ChatMessage::user("Hello"),
         ];
-        let (instructions, input) = split_messages(messages);
+        let (instructions, input) = split_messages(messages, false);
         assert_eq!(
             instructions,
             Some("First instruction\n\nSecond instruction".to_string())
         );
         assert_eq!(input.len(), 1);
+    }
+
+    #[test]
+    fn test_split_messages_chaining_converts_tool_results() {
+        let messages = vec![
+            ChatMessage::user("Hello"),
+            ChatMessage::tool_result("call_123", "my_tool", "result data"),
+        ];
+        let (_, input) = split_messages(messages, true);
+        assert_eq!(input.len(), 2);
+        match &input[1] {
+            NearAiInputItem::FunctionCallOutput {
+                call_id, output, ..
+            } => {
+                assert_eq!(call_id, "call_123");
+                assert_eq!(output, "result data");
+            }
+            _ => panic!("expected FunctionCallOutput"),
+        }
+    }
+
+    #[test]
+    fn test_split_messages_no_chaining_keeps_tool_as_message() {
+        let messages = vec![
+            ChatMessage::user("Hello"),
+            ChatMessage::tool_result("call_123", "my_tool", "result data"),
+        ];
+        let (_, input) = split_messages(messages, false);
+        assert_eq!(input.len(), 2);
+        match &input[1] {
+            NearAiInputItem::Message(m) => assert_eq!(m.role, "tool"),
+            _ => panic!("expected Message"),
+        }
     }
 }

@@ -1,6 +1,9 @@
 //! Configuration management CLI commands.
 //!
 //! Commands for viewing and modifying settings.
+//! Settings are stored in the database (env > DB > default).
+
+use std::sync::Arc;
 
 use clap::Subcommand;
 
@@ -36,41 +39,81 @@ pub enum ConfigCommand {
         path: String,
     },
 
-    /// Show the settings file path
+    /// Show the settings storage info
     Path,
 }
 
 /// Run a config command.
-pub fn run_config_command(cmd: ConfigCommand) -> anyhow::Result<()> {
+///
+/// Connects to the database to read/write settings. Falls back to disk
+/// if the database is not available.
+pub async fn run_config_command(cmd: ConfigCommand) -> anyhow::Result<()> {
+    // Try to connect to the DB for settings access
+    let db: Option<Arc<dyn crate::db::Database>> = match connect_db().await {
+        Ok(d) => Some(d),
+        Err(e) => {
+            eprintln!(
+                "Warning: Could not connect to database ({}), using disk fallback",
+                e
+            );
+            None
+        }
+    };
+
+    let db_ref = db.as_deref();
     match cmd {
-        ConfigCommand::List { filter } => list_settings(filter),
-        ConfigCommand::Get { path } => get_setting(&path),
-        ConfigCommand::Set { path, value } => set_setting(&path, &value),
-        ConfigCommand::Reset { path } => reset_setting(&path),
-        ConfigCommand::Path => show_path(),
+        ConfigCommand::List { filter } => list_settings(db_ref, filter).await,
+        ConfigCommand::Get { path } => get_setting(db_ref, &path).await,
+        ConfigCommand::Set { path, value } => set_setting(db_ref, &path, &value).await,
+        ConfigCommand::Reset { path } => reset_setting(db_ref, &path).await,
+        ConfigCommand::Path => show_path(db_ref.is_some()),
     }
 }
 
+/// Bootstrap a DB connection for config commands (backend-agnostic).
+async fn connect_db() -> anyhow::Result<Arc<dyn crate::db::Database>> {
+    let config = crate::config::Config::from_env()
+        .await
+        .map_err(|e| anyhow::anyhow!("{}", e))?;
+    crate::db::connect_from_config(&config.database)
+        .await
+        .map_err(|e| anyhow::anyhow!("{}", e))
+}
+
+const DEFAULT_USER_ID: &str = "default";
+
+/// Load settings: DB if available, else disk.
+async fn load_settings(store: Option<&dyn crate::db::Database>) -> Settings {
+    if let Some(store) = store {
+        match store.get_all_settings(DEFAULT_USER_ID).await {
+            Ok(map) if !map.is_empty() => return Settings::from_db_map(&map),
+            _ => {}
+        }
+    }
+    Settings::default()
+}
+
 /// List all settings.
-fn list_settings(filter: Option<String>) -> anyhow::Result<()> {
-    let settings = Settings::load();
+async fn list_settings(
+    store: Option<&dyn crate::db::Database>,
+    filter: Option<String>,
+) -> anyhow::Result<()> {
+    let settings = load_settings(store).await;
     let all = settings.list();
 
-    // Find the longest key for alignment
     let max_key_len = all.iter().map(|(k, _)| k.len()).max().unwrap_or(0);
 
-    println!("Settings:");
+    let source = if store.is_some() { "database" } else { "disk" };
+    println!("Settings (source: {}):", source);
     println!();
 
     for (key, value) in all {
-        // Skip if filter is set and doesn't match
-        if let Some(ref f) = filter {
-            if !key.starts_with(f) {
-                continue;
-            }
+        if let Some(ref f) = filter
+            && !key.starts_with(f)
+        {
+            continue;
         }
 
-        // Truncate long values for display
         let display_value = if value.len() > 60 {
             format!("{}...", &value[..57])
         } else {
@@ -84,8 +127,8 @@ fn list_settings(filter: Option<String>) -> anyhow::Result<()> {
 }
 
 /// Get a specific setting.
-fn get_setting(path: &str) -> anyhow::Result<()> {
-    let settings = Settings::load();
+async fn get_setting(store: Option<&dyn crate::db::Database>, path: &str) -> anyhow::Result<()> {
+    let settings = load_settings(store).await;
 
     match settings.get(path) {
         Some(value) => {
@@ -99,68 +142,63 @@ fn get_setting(path: &str) -> anyhow::Result<()> {
 }
 
 /// Set a setting value.
-fn set_setting(path: &str, value: &str) -> anyhow::Result<()> {
-    let mut settings = Settings::load();
+async fn set_setting(
+    store: Option<&dyn crate::db::Database>,
+    path: &str,
+    value: &str,
+) -> anyhow::Result<()> {
+    let mut settings = load_settings(store).await;
 
-    // Try to set the value
     settings
         .set(path, value)
         .map_err(|e| anyhow::anyhow!("{}", e))?;
 
-    // Save to disk
-    settings.save()?;
+    let store = store.ok_or_else(|| {
+        anyhow::anyhow!("Database connection required to save settings. Check DATABASE_URL.")
+    })?;
+    let json_value = match serde_json::from_str::<serde_json::Value>(value) {
+        Ok(v) => v,
+        Err(_) => serde_json::Value::String(value.to_string()),
+    };
+    store
+        .set_setting(DEFAULT_USER_ID, path, &json_value)
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to save to database: {}", e))?;
 
     println!("Set {} = {}", path, value);
     Ok(())
 }
 
 /// Reset a setting to default.
-fn reset_setting(path: &str) -> anyhow::Result<()> {
-    let mut settings = Settings::load();
-
-    // Get the default value for display
+async fn reset_setting(store: Option<&dyn crate::db::Database>, path: &str) -> anyhow::Result<()> {
     let default = Settings::default();
     let default_value = default
         .get(path)
         .ok_or_else(|| anyhow::anyhow!("Unknown setting: {}", path))?;
 
-    // Reset it
-    settings.reset(path).map_err(|e| anyhow::anyhow!("{}", e))?;
-
-    // Save to disk
-    settings.save()?;
+    let store = store.ok_or_else(|| {
+        anyhow::anyhow!("Database connection required to reset settings. Check DATABASE_URL.")
+    })?;
+    store
+        .delete_setting(DEFAULT_USER_ID, path)
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to delete setting from database: {}", e))?;
 
     println!("Reset {} to default: {}", path, default_value);
     Ok(())
 }
 
-/// Show the settings file path.
-fn show_path() -> anyhow::Result<()> {
-    let path = Settings::default_path();
-    println!("{}", path.display());
-
-    if path.exists() {
-        let metadata = std::fs::metadata(&path)?;
-        println!("  Size: {} bytes", metadata.len());
-        if let Ok(modified) = metadata.modified() {
-            use std::time::SystemTime;
-            let duration = SystemTime::now()
-                .duration_since(modified)
-                .unwrap_or_default();
-            let secs = duration.as_secs();
-            if secs < 60 {
-                println!("  Modified: {} seconds ago", secs);
-            } else if secs < 3600 {
-                println!("  Modified: {} minutes ago", secs / 60);
-            } else if secs < 86400 {
-                println!("  Modified: {} hours ago", secs / 3600);
-            } else {
-                println!("  Modified: {} days ago", secs / 86400);
-            }
-        }
+/// Show the settings storage info.
+fn show_path(has_db: bool) -> anyhow::Result<()> {
+    if has_db {
+        println!("Settings stored in: database (settings table)");
     } else {
-        println!("  (does not exist, using defaults)");
+        println!("Settings stored in: PostgreSQL (not connected, using defaults)");
     }
+    println!(
+        "Env config:         {}",
+        crate::bootstrap::ironclaw_env_path().display()
+    );
 
     Ok(())
 }

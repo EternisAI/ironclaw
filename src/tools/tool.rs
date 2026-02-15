@@ -9,6 +9,18 @@ use thiserror::Error;
 
 use crate::context::JobContext;
 
+/// Where a tool should execute: orchestrator process or inside a container.
+///
+/// Orchestrator tools run in the main agent process (memory access, job mgmt, etc).
+/// Container tools run inside Docker containers (shell, file ops, code mods).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ToolDomain {
+    /// Safe to run in the orchestrator (pure functions, memory, job management).
+    Orchestrator,
+    /// Must run inside a sandboxed container (filesystem, shell, code).
+    Container,
+}
+
 /// Error type for tool execution.
 #[derive(Debug, Error)]
 pub enum ToolError {
@@ -160,6 +172,23 @@ pub trait Tool: Send + Sync {
         false
     }
 
+    /// Maximum time this tool is allowed to run before the caller kills it.
+    /// Override for long-running tools like sandbox execution.
+    /// Default: 60 seconds.
+    fn execution_timeout(&self) -> Duration {
+        Duration::from_secs(60)
+    }
+
+    /// Where this tool should execute.
+    ///
+    /// `Orchestrator` tools run in the main agent process (safe, no FS access).
+    /// `Container` tools run inside Docker containers (shell, file ops).
+    ///
+    /// Default: `Orchestrator` (safe for the main process).
+    fn domain(&self) -> ToolDomain {
+        ToolDomain::Orchestrator
+    }
+
     /// Get the tool schema for LLM function calling.
     fn schema(&self) -> ToolSchema {
         ToolSchema {
@@ -170,56 +199,73 @@ pub trait Tool: Send + Sync {
     }
 }
 
-/// A simple no-op tool for testing.
-#[derive(Debug)]
-pub struct EchoTool;
+/// Extract a required string parameter from a JSON object.
+///
+/// Returns `ToolError::InvalidParameters` if the key is missing or not a string.
+pub fn require_str<'a>(params: &'a serde_json::Value, name: &str) -> Result<&'a str, ToolError> {
+    params
+        .get(name)
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| ToolError::InvalidParameters(format!("missing '{}' parameter", name)))
+}
 
-#[async_trait]
-impl Tool for EchoTool {
-    fn name(&self) -> &str {
-        "echo"
-    }
-
-    fn description(&self) -> &str {
-        "Echoes back the input message. Useful for testing."
-    }
-
-    fn parameters_schema(&self) -> serde_json::Value {
-        serde_json::json!({
-            "type": "object",
-            "properties": {
-                "message": {
-                    "type": "string",
-                    "description": "The message to echo back"
-                }
-            },
-            "required": ["message"]
-        })
-    }
-
-    async fn execute(
-        &self,
-        params: serde_json::Value,
-        _ctx: &JobContext,
-    ) -> Result<ToolOutput, ToolError> {
-        let message = params
-            .get("message")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| {
-                ToolError::InvalidParameters("missing 'message' parameter".to_string())
-            })?;
-
-        Ok(ToolOutput::text(message, Duration::from_millis(1)))
-    }
-
-    fn requires_sanitization(&self) -> bool {
-        false // Echo is a trusted internal tool
-    }
+/// Extract a required parameter of any type from a JSON object.
+///
+/// Returns `ToolError::InvalidParameters` if the key is missing.
+pub fn require_param<'a>(
+    params: &'a serde_json::Value,
+    name: &str,
+) -> Result<&'a serde_json::Value, ToolError> {
+    params
+        .get(name)
+        .ok_or_else(|| ToolError::InvalidParameters(format!("missing '{}' parameter", name)))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A simple no-op tool for testing.
+    #[derive(Debug)]
+    pub struct EchoTool;
+
+    #[async_trait]
+    impl Tool for EchoTool {
+        fn name(&self) -> &str {
+            "echo"
+        }
+
+        fn description(&self) -> &str {
+            "Echoes back the input message. Useful for testing."
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "message": {
+                        "type": "string",
+                        "description": "The message to echo back"
+                    }
+                },
+                "required": ["message"]
+            })
+        }
+
+        async fn execute(
+            &self,
+            params: serde_json::Value,
+            _ctx: &JobContext,
+        ) -> Result<ToolOutput, ToolError> {
+            let message = require_str(&params, "message")?;
+
+            Ok(ToolOutput::text(message, Duration::from_millis(1)))
+        }
+
+        fn requires_sanitization(&self) -> bool {
+            false // Echo is a trusted internal tool
+        }
+    }
 
     #[tokio::test]
     async fn test_echo_tool() {
@@ -241,5 +287,47 @@ mod tests {
 
         assert_eq!(schema.name, "echo");
         assert!(!schema.description.is_empty());
+    }
+
+    #[test]
+    fn test_execution_timeout_default() {
+        let tool = EchoTool;
+        assert_eq!(tool.execution_timeout(), Duration::from_secs(60));
+    }
+
+    #[test]
+    fn test_require_str_present() {
+        let params = serde_json::json!({"name": "alice"});
+        assert_eq!(require_str(&params, "name").unwrap(), "alice");
+    }
+
+    #[test]
+    fn test_require_str_missing() {
+        let params = serde_json::json!({});
+        let err = require_str(&params, "name").unwrap_err();
+        assert!(err.to_string().contains("missing 'name'"));
+    }
+
+    #[test]
+    fn test_require_str_wrong_type() {
+        let params = serde_json::json!({"name": 42});
+        let err = require_str(&params, "name").unwrap_err();
+        assert!(err.to_string().contains("missing 'name'"));
+    }
+
+    #[test]
+    fn test_require_param_present() {
+        let params = serde_json::json!({"data": [1, 2, 3]});
+        assert_eq!(
+            require_param(&params, "data").unwrap(),
+            &serde_json::json!([1, 2, 3])
+        );
+    }
+
+    #[test]
+    fn test_require_param_missing() {
+        let params = serde_json::json!({});
+        let err = require_param(&params, "data").unwrap_err();
+        assert!(err.to_string().contains("missing 'data'"));
     }
 }

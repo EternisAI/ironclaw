@@ -15,6 +15,10 @@ pub struct Settings {
     pub onboard_completed: bool,
 
     // === Step 1: Database ===
+    /// Database backend: "postgres" or "libsql".
+    #[serde(default)]
+    pub database_backend: Option<String>,
+
     /// Database connection URL (postgres://...).
     #[serde(default)]
     pub database_url: Option<String>,
@@ -22,6 +26,14 @@ pub struct Settings {
     /// Database pool size.
     #[serde(default)]
     pub database_pool_size: Option<usize>,
+
+    /// Path to local libSQL database file.
+    #[serde(default)]
+    pub libsql_path: Option<String>,
+
+    /// Turso cloud URL for remote replica sync.
+    #[serde(default)]
+    pub libsql_url: Option<String>,
 
     // === Step 2: Security ===
     /// Source for the secrets master key.
@@ -148,6 +160,11 @@ pub struct ChannelSettings {
     /// HTTP webhook host.
     #[serde(default)]
     pub http_host: Option<String>,
+
+    /// Telegram owner user ID. When set, the bot only responds to this user.
+    /// Captured during setup by having the user message the bot.
+    #[serde(default)]
+    pub telegram_owner_id: Option<i64>,
 
     /// Enabled WASM channels by name.
     /// Channels not in this list but present in the channels directory will still load.
@@ -482,10 +499,55 @@ impl Default for BuilderSettings {
 }
 
 impl Settings {
+    /// Reconstruct Settings from a flat key-value map (as stored in the DB).
+    ///
+    /// Each key is a dotted path (e.g., "agent.name"), value is a JSONB value.
+    /// Missing keys get their default value.
+    pub fn from_db_map(map: &std::collections::HashMap<String, serde_json::Value>) -> Self {
+        // Start with defaults, then overlay each DB setting
+        let mut settings = Self::default();
+
+        for (key, value) in map {
+            // Convert the JSONB value to a string for the existing set() method
+            let value_str = match value {
+                serde_json::Value::String(s) => s.clone(),
+                serde_json::Value::Bool(b) => b.to_string(),
+                serde_json::Value::Number(n) => n.to_string(),
+                serde_json::Value::Null => "null".to_string(),
+                other => other.to_string(),
+            };
+
+            if let Err(e) = settings.set(key, &value_str) {
+                tracing::warn!(
+                    "Failed to apply DB setting '{}' = '{}': {}",
+                    key,
+                    value_str,
+                    e
+                );
+            }
+        }
+
+        settings
+    }
+
+    /// Flatten Settings into a key-value map suitable for DB storage.
+    ///
+    /// Each entry is a (dotted_path, JSONB value) pair.
+    pub fn to_db_map(&self) -> std::collections::HashMap<String, serde_json::Value> {
+        let json = match serde_json::to_value(self) {
+            Ok(v) => v,
+            Err(_) => return std::collections::HashMap::new(),
+        };
+
+        let mut map = std::collections::HashMap::new();
+        collect_settings_json(&json, String::new(), &mut map);
+        map
+    }
+
     /// Get the default settings file path (~/.ironclaw/settings.json).
-    pub fn default_path() -> PathBuf {
+    pub fn default_path() -> std::path::PathBuf {
         dirs::home_dir()
-            .unwrap_or_else(|| PathBuf::from("."))
+            .unwrap_or_else(|| std::path::PathBuf::from("."))
             .join(".ironclaw")
             .join("settings.json")
     }
@@ -495,43 +557,12 @@ impl Settings {
         Self::load_from(&Self::default_path())
     }
 
-    /// Load settings from a specific path.
-    pub fn load_from(path: &PathBuf) -> Self {
+    /// Load settings from a specific path (used by bootstrap legacy migration).
+    pub fn load_from(path: &std::path::Path) -> Self {
         match std::fs::read_to_string(path) {
             Ok(data) => serde_json::from_str(&data).unwrap_or_default(),
             Err(_) => Self::default(),
         }
-    }
-
-    /// Save settings to disk.
-    pub fn save(&self) -> std::io::Result<()> {
-        self.save_to(&Self::default_path())
-    }
-
-    /// Save settings to a specific path.
-    pub fn save_to(&self, path: &PathBuf) -> std::io::Result<()> {
-        // Ensure parent directory exists
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-
-        let json = serde_json::to_string_pretty(self)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
-
-        std::fs::write(path, json)
-    }
-
-    /// Get the selected model, falling back to the provided default.
-    pub fn model_or(&self, default: &str) -> String {
-        self.selected_model
-            .clone()
-            .unwrap_or_else(|| default.to_string())
-    }
-
-    /// Set the selected model and save.
-    pub fn set_model(&mut self, model: &str) -> std::io::Result<()> {
-        self.selected_model = Some(model.to_string());
-        self.save()
     }
 
     /// Get a setting value by dotted path (e.g., "agent.max_parallel_jobs").
@@ -656,6 +687,29 @@ impl Settings {
     }
 }
 
+/// Recursively collect settings paths with their JSON values (for DB storage).
+fn collect_settings_json(
+    value: &serde_json::Value,
+    prefix: String,
+    results: &mut std::collections::HashMap<String, serde_json::Value>,
+) {
+    match value {
+        serde_json::Value::Object(obj) => {
+            for (key, val) in obj {
+                let path = if prefix.is_empty() {
+                    key.clone()
+                } else {
+                    format!("{}.{}", prefix, key)
+                };
+                collect_settings_json(val, path, results);
+            }
+        }
+        other => {
+            results.insert(prefix, other.clone());
+        }
+    }
+}
+
 /// Recursively collect settings paths and values.
 fn collect_settings(
     value: &serde_json::Value,
@@ -695,40 +749,20 @@ fn collect_settings(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::tempdir;
 
     #[test]
-    fn test_settings_save_load() {
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("settings.json");
-
+    fn test_db_map_round_trip() {
         let settings = Settings {
             selected_model: Some("claude-3-5-sonnet-20241022".to_string()),
             ..Default::default()
         };
 
-        settings.save_to(&path).unwrap();
-
-        let loaded = Settings::load_from(&path);
+        let map = settings.to_db_map();
+        let restored = Settings::from_db_map(&map);
         assert_eq!(
-            loaded.selected_model,
+            restored.selected_model,
             Some("claude-3-5-sonnet-20241022".to_string())
         );
-    }
-
-    #[test]
-    fn test_model_or_default() {
-        let settings = Settings::default();
-        assert_eq!(
-            settings.model_or("default-model"),
-            "default-model".to_string()
-        );
-
-        let settings = Settings {
-            selected_model: Some("my-model".to_string()),
-            ..Default::default()
-        };
-        assert_eq!(settings.model_or("default-model"), "my-model".to_string());
     }
 
     #[test]
@@ -798,5 +832,30 @@ mod tests {
         assert!(!settings.embeddings.enabled);
         assert_eq!(settings.embeddings.provider, "nearai");
         assert_eq!(settings.embeddings.model, "text-embedding-3-small");
+    }
+
+    #[test]
+    fn test_telegram_owner_id_db_round_trip() {
+        let mut settings = Settings::default();
+        settings.channels.telegram_owner_id = Some(123456789);
+
+        let map = settings.to_db_map();
+        let restored = Settings::from_db_map(&map);
+        assert_eq!(restored.channels.telegram_owner_id, Some(123456789));
+    }
+
+    #[test]
+    fn test_telegram_owner_id_default_none() {
+        let settings = Settings::default();
+        assert_eq!(settings.channels.telegram_owner_id, None);
+    }
+
+    #[test]
+    fn test_telegram_owner_id_via_set() {
+        let mut settings = Settings::default();
+        settings
+            .set("channels.telegram_owner_id", "987654321")
+            .unwrap();
+        assert_eq!(settings.channels.telegram_owner_id, Some(987654321));
     }
 }

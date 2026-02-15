@@ -43,7 +43,10 @@ IronClaw is the AI assistant you can actually trust with your personal and profe
 
 ### Always Available
 
-- **Multi-channel** - REPL, HTTP webhooks, and extensible WASM channels (Telegram, Slack, and more)
+- **Multi-channel** - REPL, HTTP webhooks, WASM channels (Telegram, Slack), and web gateway
+- **Docker Sandbox** - Isolated container execution with per-job tokens and orchestrator/worker pattern
+- **Web Gateway** - Browser UI with real-time SSE/WebSocket streaming
+- **Routines** - Cron schedules, event triggers, webhook handlers for background automation
 - **Heartbeat System** - Proactive background execution for monitoring and maintenance tasks
 - **Parallel Jobs** - Handle multiple requests concurrently with isolated contexts
 - **Self-repair** - Automatic detection and recovery of stuck operations
@@ -65,10 +68,41 @@ IronClaw is the AI assistant you can actually trust with your personal and profe
 ### Prerequisites
 
 - Rust 1.85+
-- PostgreSQL 15+ with pgvector extension
+- PostgreSQL 15+ with [pgvector](https://github.com/pgvector/pgvector) extension
 - NEAR AI account (authentication handled via setup wizard)
 
-### Build
+## Download or Build
+
+Visit [Releases page](https://github.com/nearai/ironclaw/releases/) to see the latest updates.
+
+<details>
+  <summary>Install via Windows Installer (Windows)</summary>
+
+Download the [Windows Installer](https://github.com/nearai/ironclaw/releases/latest/download/ironclaw-x86_64-pc-windows-msvc.msi) and run it.
+
+</details>
+
+<details>
+  <summary>Install via powershell script (Windows)</summary>
+
+```sh
+irm https://github.com/nearai/ironclaw/releases/latest/download/ironclaw-installer.ps1 | iex
+```
+
+</details>
+
+<details>
+  <summary>Install via shell script (macOS, Linux, Windows/WSL)</summary>
+
+```sh
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/nearai/ironclaw/releases/latest/download/ironclaw-installer.sh | sh
+```
+</details>
+
+<details>
+  <summary>Compile the source code (Cargo on Windows, Linux, macOS)</summary>
+
+Install it with `cargo`, just make sure you have [Rust](https://rustup.rs) installed on your computer.
 
 ```bash
 # Clone the repository
@@ -81,6 +115,10 @@ cargo build --release
 # Run tests
 cargo test
 ```
+
+For **full release** (after modifying channel sources), run `./scripts/build-all.sh` to rebuild channels first.
+
+</details>
 
 ### Database Setup
 
@@ -97,7 +135,7 @@ psql ironclaw -c "CREATE EXTENSION IF NOT EXISTS vector;"
 Run the setup wizard to configure IronClaw:
 
 ```bash
-ironclaw setup
+ironclaw onboard
 ```
 
 The wizard handles database connection, NEAR AI authentication (via browser OAuth),
@@ -143,37 +181,42 @@ External content passes through multiple security layers:
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                         Channels                                 │
-│  ┌──────┐  ┌──────┐  ┌──────────────┐                           │
-│  │ REPL │  │ HTTP │  │ WASM Channels│                           │
-│  └──┬───┘  └──┬───┘  └──────┬───────┘                           │
-│     └─────────┴─────────────┘                                    │
-│                         │                                        │
-│                    ┌────▼────┐                                  │
-│                    │  Router │  Intent classification           │
-│                    └────┬────┘                                  │
-│                         │                                        │
-│              ┌──────────▼──────────┐                            │
-│              │     Scheduler       │  Parallel job management   │
-│              └──────────┬──────────┘                            │
-│                         │                                        │
-│         ┌───────────────┼───────────────┐                       │
-│         ▼               ▼               ▼                       │
-│    ┌─────────┐    ┌─────────┐    ┌─────────┐                   │
-│    │ Worker  │    │ Worker  │    │ Worker  │  LLM reasoning    │
-│    └────┬────┘    └────┬────┘    └────┬────┘                   │
-│         └───────────────┼───────────────┘                       │
-│                         │                                        │
-│              ┌──────────▼──────────┐                            │
-│              │   Tool Registry     │                            │
-│              │  ┌───────────────┐  │                            │
-│              │  │ Built-in      │  │                            │
-│              │  │ MCP           │  │                            │
-│              │  │ WASM Sandbox  │  │                            │
-│              │  └───────────────┘  │                            │
-│              └─────────────────────┘                            │
-└─────────────────────────────────────────────────────────────────┘
+┌────────────────────────────────────────────────────────────────┐
+│                          Channels                              │
+│  ┌──────┐  ┌──────┐   ┌─────────────┐  ┌─────────────┐         │
+│  │ REPL │  │ HTTP │   │WASM Channels│  │ Web Gateway │         │
+│  └──┬───┘  └──┬───┘   └──────┬──────┘  │ (SSE + WS)  │         │
+│     │         │              │         └──────┬──────┘         │
+│     └─────────┴──────────────┴────────────────┘                │
+│                              │                                 │
+│                    ┌─────────▼─────────┐                       │
+│                    │    Agent Loop     │  Intent routing       │
+│                    └────┬──────────┬───┘                       │
+│                         │          │                           │
+│              ┌──────────▼────┐  ┌──▼───────────────┐           │
+│              │  Scheduler    │  │ Routines Engine  │           │
+│              │(parallel jobs)│  │(cron, event, wh) │           │
+│              └──────┬────────┘  └────────┬─────────┘           │
+│                     │                    │                     │
+│       ┌─────────────┼────────────────────┘                     │
+│       │             │                                          │
+│   ┌───▼─────┐  ┌────▼────────────────┐                         │
+│   │ Local   │  │    Orchestrator     │                         │
+│   │Workers  │  │  ┌───────────────┐  │                         │
+│   │(in-proc)│  │  │ Docker Sandbox│  │                         │
+│   └───┬─────┘  │  │   Containers  │  │                         │
+│       │        │  │ ┌───────────┐ │  │                         │
+│       │        │  │ │Worker / CC│ │  │                         │
+│       │        │  │ └───────────┘ │  │                         │
+│       │        │  └───────────────┘  │                         │
+│       │        └─────────┬───────────┘                         │
+│       └──────────────────┤                                     │
+│                          │                                     │
+│              ┌───────────▼──────────┐                          │
+│              │    Tool Registry     │                          │
+│              │  Built-in, MCP, WASM │                          │
+│              └──────────────────────┘                          │
+└────────────────────────────────────────────────────────────────┘
 ```
 
 ### Core Components
@@ -184,6 +227,9 @@ External content passes through multiple security layers:
 | **Router** | Classifies user intent (command, query, task) |
 | **Scheduler** | Manages parallel job execution with priorities |
 | **Worker** | Executes jobs with LLM reasoning and tool calls |
+| **Orchestrator** | Container lifecycle, LLM proxying, per-job auth |
+| **Web Gateway** | Browser UI with chat, memory, jobs, logs, extensions, routines |
+| **Routines Engine** | Scheduled (cron) and reactive (event, webhook) background tasks |
 | **Workspace** | Persistent memory with hybrid search |
 | **Safety Layer** | Prompt injection defense and content sanitization |
 
@@ -191,7 +237,7 @@ External content passes through multiple security layers:
 
 ```bash
 # First-time setup (configures database, auth, etc.)
-ironclaw setup
+ironclaw onboard
 
 # Start interactive REPL
 cargo run
@@ -210,11 +256,15 @@ cargo fmt
 cargo clippy --all --benches --tests --examples --all-features
 
 # Run tests
+createdb ironclaw_test
 cargo test
 
 # Run specific test
 cargo test test_name
 ```
+
+- **Telegram channel**: See [docs/TELEGRAM_SETUP.md](docs/TELEGRAM_SETUP.md) for setup and DM pairing.
+- **Changing channel sources**: Run `./channels-src/telegram/build.sh` before `cargo build` so the updated WASM is bundled.
 
 ## OpenClaw Heritage
 

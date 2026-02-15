@@ -33,8 +33,15 @@ use termimad::MadSkin;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
+use crate::agent::truncate_for_preview;
 use crate::channels::{Channel, IncomingMessage, MessageStream, OutgoingResponse, StatusUpdate};
 use crate::error::ChannelError;
+
+/// Max characters for tool result previews in the terminal.
+const CLI_TOOL_RESULT_MAX: usize = 200;
+
+/// Max characters for thinking/status messages in the terminal.
+const CLI_STATUS_MAX: usize = 200;
 
 /// Slash commands available in the REPL.
 const SLASH_COMMANDS: &[&str] = &[
@@ -42,12 +49,25 @@ const SLASH_COMMANDS: &[&str] = &[
     "/quit",
     "/exit",
     "/debug",
+    "/model",
     "/undo",
     "/redo",
     "/clear",
     "/compact",
     "/new",
     "/interrupt",
+    "/version",
+    "/tools",
+    "/ping",
+    "/job",
+    "/status",
+    "/cancel",
+    "/list",
+    "/heartbeat",
+    "/summarize",
+    "/suggest",
+    "/thread",
+    "/resume",
 ];
 
 /// Rustyline helper for slash-command tab completion.
@@ -248,7 +268,7 @@ impl Channel for ReplChannel {
         std::thread::spawn(move || {
             // Single message mode: send it and return
             if let Some(msg) = single_message {
-                let incoming = IncomingMessage::new("repl", "user", &msg);
+                let incoming = IncomingMessage::new("repl", "default", &msg);
                 let _ = tx.blocking_send(incoming);
                 return;
             }
@@ -295,10 +315,11 @@ impl Channel for ReplChannel {
                             continue;
                         }
 
-                        // Handle local REPL commands
+                        // Handle local REPL commands (only commands that need
+                        // immediate local handling stay here)
                         match line.to_lowercase().as_str() {
                             "/quit" | "/exit" => break,
-                            "/help" | "/?" => {
+                            "/help" => {
                                 print_help();
                                 continue;
                             }
@@ -315,21 +336,21 @@ impl Channel for ReplChannel {
                             _ => {}
                         }
 
-                        let msg = IncomingMessage::new("repl", "user", line);
+                        let msg = IncomingMessage::new("repl", "default", line);
                         if tx.blocking_send(msg).is_err() {
                             break;
                         }
                     }
                     Err(ReadlineError::Interrupted) => {
                         // Ctrl+C: send /interrupt
-                        let msg = IncomingMessage::new("repl", "user", "/interrupt");
+                        let msg = IncomingMessage::new("repl", "default", "/interrupt");
                         if tx.blocking_send(msg).is_err() {
                             break;
                         }
                     }
                     Err(ReadlineError::Eof) => {
                         // Ctrl+D: send /quit so the agent loop runs graceful shutdown
-                        let msg = IncomingMessage::new("repl", "user", "/quit");
+                        let msg = IncomingMessage::new("repl", "default", "/quit");
                         let _ = tx.blocking_send(msg);
                         break;
                     }
@@ -386,7 +407,8 @@ impl Channel for ReplChannel {
 
         match status {
             StatusUpdate::Thinking(msg) => {
-                eprintln!("  \x1b[90m\u{25CB} {msg}\x1b[0m");
+                let display = truncate_for_preview(&msg, CLI_STATUS_MAX);
+                eprintln!("  \x1b[90m\u{25CB} {display}\x1b[0m");
             }
             StatusUpdate::ToolStarted { name } => {
                 eprintln!("  \x1b[33m\u{25CB} {name}\x1b[0m");
@@ -399,7 +421,8 @@ impl Channel for ReplChannel {
                 }
             }
             StatusUpdate::ToolResult { name: _, preview } => {
-                eprintln!("    \x1b[90m{preview}\x1b[0m");
+                let display = truncate_for_preview(&preview, CLI_TOOL_RESULT_MAX);
+                eprintln!("    \x1b[90m{display}\x1b[0m");
             }
             StatusUpdate::StreamChunk(chunk) => {
                 // Print separator on the false-to-true transition
@@ -413,9 +436,19 @@ impl Channel for ReplChannel {
                 print!("{chunk}");
                 let _ = io::stdout().flush();
             }
+            StatusUpdate::JobStarted {
+                job_id,
+                title,
+                browse_url,
+            } => {
+                eprintln!(
+                    "  \x1b[36m[job]\x1b[0m {title} \x1b[90m({job_id})\x1b[0m \x1b[4m{browse_url}\x1b[0m"
+                );
+            }
             StatusUpdate::Status(msg) => {
                 if debug || msg.contains("approval") || msg.contains("Approval") {
-                    eprintln!("  \x1b[90m{msg}\x1b[0m");
+                    let display = truncate_for_preview(&msg, CLI_STATUS_MAX);
+                    eprintln!("  \x1b[90m{display}\x1b[0m");
                 }
             }
             StatusUpdate::ApprovalNeeded {
@@ -471,6 +504,33 @@ impl Channel for ReplChannel {
                 );
                 eprintln!("  {bot_border}");
                 eprintln!();
+            }
+            StatusUpdate::AuthRequired {
+                extension_name,
+                instructions,
+                setup_url,
+                ..
+            } => {
+                eprintln!();
+                eprintln!("\x1b[33m  Authentication required for {extension_name}\x1b[0m");
+                if let Some(ref instr) = instructions {
+                    eprintln!("  {instr}");
+                }
+                if let Some(ref url) = setup_url {
+                    eprintln!("  \x1b[4m{url}\x1b[0m");
+                }
+                eprintln!();
+            }
+            StatusUpdate::AuthCompleted {
+                extension_name,
+                success,
+                message,
+            } => {
+                if success {
+                    eprintln!("\x1b[32m  {extension_name}: {message}\x1b[0m");
+                } else {
+                    eprintln!("\x1b[31m  {extension_name}: {message}\x1b[0m");
+                }
             }
         }
         Ok(())

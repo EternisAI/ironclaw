@@ -48,6 +48,7 @@ use crate::channels::wasm::runtime::{PreparedChannelModule, WasmChannelRuntime};
 use crate::channels::wasm::schema::ChannelConfig;
 use crate::channels::{Channel, IncomingMessage, MessageStream, OutgoingResponse, StatusUpdate};
 use crate::error::ChannelError;
+use crate::pairing::PairingStore;
 use crate::safety::LeakDetector;
 use crate::tools::wasm::LogLevel;
 use crate::tools::wasm::WasmResourceLimiter;
@@ -73,6 +74,11 @@ struct ChannelStoreData {
     /// Injected credentials for URL substitution (e.g., bot tokens).
     /// Keys are placeholder names like "TELEGRAM_BOT_TOKEN".
     credentials: HashMap<String, String>,
+    /// Pairing store for DM pairing (guest access control).
+    pairing_store: Arc<PairingStore>,
+    /// Dedicated tokio runtime for HTTP requests, lazily initialized.
+    /// Reused across multiple `http_request` calls within one execution.
+    http_runtime: Option<tokio::runtime::Runtime>,
 }
 
 impl ChannelStoreData {
@@ -81,6 +87,7 @@ impl ChannelStoreData {
         channel_name: &str,
         capabilities: ChannelCapabilities,
         credentials: HashMap<String, String>,
+        pairing_store: Arc<PairingStore>,
     ) -> Self {
         // Create a minimal WASI context (no filesystem, no env vars for security)
         let wasi = WasiCtxBuilder::new().build();
@@ -91,6 +98,8 @@ impl ChannelStoreData {
             wasi,
             table: ResourceTable::new(),
             credentials,
+            pairing_store,
+            http_runtime: None,
         }
     }
 
@@ -129,16 +138,32 @@ impl ChannelStoreData {
         if result.contains('{') && result.contains('}') {
             // Only warn if it looks like an unresolved placeholder (not JSON braces)
             let brace_pattern = regex::Regex::new(r"\{[A-Z_]+\}").ok();
-            if let Some(re) = brace_pattern {
-                if re.is_match(&result) {
-                    tracing::warn!(
-                        context = %context,
-                        "String may contain unresolved credential placeholders"
-                    );
-                }
+            if let Some(re) = brace_pattern
+                && re.is_match(&result)
+            {
+                tracing::warn!(
+                    context = %context,
+                    "String may contain unresolved credential placeholders"
+                );
             }
         }
 
+        result
+    }
+
+    /// Replace injected credential values with `[REDACTED]` in text.
+    ///
+    /// Prevents credentials from leaking through error messages, logs, or
+    /// return values to WASM. reqwest::Error includes the full URL in its
+    /// Display output, so any error from an injected-URL request will
+    /// contain the raw credential unless we scrub it.
+    fn redact_credentials(&self, text: &str) -> String {
+        let mut result = text.to_string();
+        for (name, value) in &self.credentials {
+            if !value.is_empty() {
+                result = result.replace(value, &format!("[REDACTED:{}]", name));
+            }
+        }
         result
     }
 }
@@ -187,6 +212,7 @@ impl near::agent::channel_host::Host for ChannelStoreData {
         url: String,
         headers_json: String,
         body: Option<Vec<u8>>,
+        timeout_ms: Option<u32>,
     ) -> Result<near::agent::channel_host::HttpResponse, String> {
         tracing::info!(
             method = %method,
@@ -251,10 +277,35 @@ impl near::agent::channel_host::Host for ChannelStoreData {
             .scan_http_request(&url, &header_vec, body.as_deref())
             .map_err(|e| format!("Potential secret leak blocked: {}", e))?;
 
-        // Make the HTTP request using blocking I/O
-        // We're already in a spawn_blocking context, so we can use block_on
-        let result = tokio::runtime::Handle::current().block_on(async {
-            let client = reqwest::Client::new();
+        // Get the max response size from capabilities (default 10MB).
+        let max_response_bytes = self
+            .host_state
+            .capabilities()
+            .tool_capabilities
+            .http
+            .as_ref()
+            .map(|h| h.max_response_bytes)
+            .unwrap_or(10 * 1024 * 1024);
+
+        // Make the HTTP request using a dedicated single-threaded runtime.
+        // We're inside spawn_blocking, so we can't rely on the main runtime's
+        // I/O driver (it may be busy with WASM compilation or other startup work).
+        // A dedicated runtime gives us our own I/O driver and avoids contention.
+        // The runtime is lazily created and reused across calls within one execution.
+        if self.http_runtime.is_none() {
+            self.http_runtime = Some(
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|e| format!("Failed to create HTTP runtime: {e}"))?,
+            );
+        }
+        let rt = self.http_runtime.as_ref().expect("just initialized");
+        let result = rt.block_on(async {
+            let client = reqwest::Client::builder()
+                .connect_timeout(std::time::Duration::from_secs(10))
+                .build()
+                .map_err(|e| format!("Failed to build HTTP client: {e}"))?;
 
             let mut request = match method.to_uppercase().as_str() {
                 "GET" => client.get(&url),
@@ -276,12 +327,21 @@ impl near::agent::channel_host::Host for ChannelStoreData {
                 request = request.body(body_bytes);
             }
 
-            // Send request with timeout
-            let response = request
-                .timeout(std::time::Duration::from_secs(30))
-                .send()
-                .await
-                .map_err(|e| format!("HTTP request failed: {}", e))?;
+            // Send request with caller-specified timeout (default 30s, max 5min).
+            let timeout_ms = timeout_ms.unwrap_or(30_000).min(300_000) as u64;
+            let timeout = std::time::Duration::from_millis(timeout_ms);
+            let response = request.timeout(timeout).send().await.map_err(|e| {
+                // Walk the full error chain so we get the actual root cause
+                // (DNS, TLS, connection refused, etc.) instead of just
+                // "error sending request for url (...)".
+                let mut chain = format!("HTTP request failed: {}", e);
+                let mut source = std::error::Error::source(&e);
+                while let Some(cause) = source {
+                    chain.push_str(&format!(" -> {}", cause));
+                    source = cause.source();
+                }
+                chain
+            })?;
 
             let status = response.status().as_u16();
             let response_headers: std::collections::HashMap<String, String> = response
@@ -294,11 +354,29 @@ impl near::agent::channel_host::Host for ChannelStoreData {
                 })
                 .collect();
             let headers_json = serde_json::to_string(&response_headers).unwrap_or_default();
+
+            // Enforce max response body size to prevent memory exhaustion.
+            let max_response = max_response_bytes;
+            if let Some(cl) = response.content_length()
+                && cl as usize > max_response
+            {
+                return Err(format!(
+                    "Response body too large: {} bytes exceeds limit of {} bytes",
+                    cl, max_response
+                ));
+            }
             let body = response
                 .bytes()
                 .await
-                .map_err(|e| format!("Failed to read response body: {}", e))?
-                .to_vec();
+                .map_err(|e| format!("Failed to read response body: {}", e))?;
+            if body.len() > max_response {
+                return Err(format!(
+                    "Response body too large: {} bytes exceeds limit of {} bytes",
+                    body.len(),
+                    max_response
+                ));
+            }
+            let body = body.to_vec();
 
             tracing::info!(
                 status = status,
@@ -329,6 +407,11 @@ impl near::agent::channel_host::Host for ChannelStoreData {
                 body,
             })
         });
+
+        // Scrub credential values from error messages before logging or returning
+        // to WASM. reqwest::Error includes the full URL (with injected credentials)
+        // in its Display output.
+        let result = result.map_err(|e| self.redact_credentials(&e));
 
         match &result {
             Ok(resp) => {
@@ -371,6 +454,43 @@ impl near::agent::channel_host::Host for ChannelStoreData {
                 tracing::error!(error = %e, "Failed to emit message to host state");
             }
         }
+    }
+
+    fn pairing_upsert_request(
+        &mut self,
+        channel: String,
+        id: String,
+        meta_json: String,
+    ) -> Result<near::agent::channel_host::PairingUpsertResult, String> {
+        let meta = if meta_json.is_empty() {
+            None
+        } else {
+            serde_json::from_str(&meta_json).ok()
+        };
+        match self.pairing_store.upsert_request(&channel, &id, meta) {
+            Ok(r) => Ok(near::agent::channel_host::PairingUpsertResult {
+                code: r.code,
+                created: r.created,
+            }),
+            Err(e) => Err(e.to_string()),
+        }
+    }
+
+    fn pairing_is_allowed(
+        &mut self,
+        channel: String,
+        id: String,
+        username: Option<String>,
+    ) -> Result<bool, String> {
+        self.pairing_store
+            .is_sender_allowed(&channel, &id, username.as_deref())
+            .map_err(|e| e.to_string())
+    }
+
+    fn pairing_read_allow_from(&mut self, channel: String) -> Result<Vec<String>, String> {
+        self.pairing_store
+            .read_allow_from(&channel)
+            .map_err(|e| e.to_string())
     }
 }
 
@@ -424,6 +544,9 @@ pub struct WasmChannel {
     /// Background task that repeats typing indicators every 4 seconds.
     /// Telegram's "typing..." indicator expires after ~5s, so we refresh it.
     typing_task: RwLock<Option<tokio::task::JoinHandle<()>>>,
+
+    /// Pairing store for DM pairing (guest access control).
+    pairing_store: Arc<PairingStore>,
 }
 
 impl WasmChannel {
@@ -433,6 +556,7 @@ impl WasmChannel {
         prepared: Arc<PreparedChannelModule>,
         capabilities: ChannelCapabilities,
         config_json: String,
+        pairing_store: Arc<PairingStore>,
     ) -> Self {
         let name = prepared.name.clone();
         let rate_limiter = ChannelEmitRateLimiter::new(capabilities.emit_rate_limit.clone());
@@ -452,6 +576,7 @@ impl WasmChannel {
             endpoints: RwLock::new(Vec::new()),
             credentials: Arc::new(RwLock::new(HashMap::new())),
             typing_task: RwLock::new(None),
+            pairing_store,
         }
     }
 
@@ -533,6 +658,7 @@ impl WasmChannel {
         prepared: &PreparedChannelModule,
         capabilities: &ChannelCapabilities,
         credentials: HashMap<String, String>,
+        pairing_store: Arc<PairingStore>,
     ) -> Result<Store<ChannelStoreData>, WasmChannelError> {
         let engine = runtime.engine();
         let limits = &prepared.limits;
@@ -543,6 +669,7 @@ impl WasmChannel {
             &prepared.name,
             capabilities.clone(),
             credentials,
+            pairing_store,
         );
         let mut store = Store::new(engine, store_data);
 
@@ -643,12 +770,18 @@ impl WasmChannel {
         let timeout = self.runtime.config().callback_timeout;
         let channel_name = self.name.clone();
         let credentials = self.get_credentials().await;
+        let pairing_store = self.pairing_store.clone();
 
         // Execute in blocking task with timeout
         let result = tokio::time::timeout(timeout, async move {
             tokio::task::spawn_blocking(move || {
-                let mut store =
-                    Self::create_store(&runtime, &prepared, &capabilities, credentials)?;
+                let mut store = Self::create_store(
+                    &runtime,
+                    &prepared,
+                    &capabilities,
+                    credentials,
+                    pairing_store,
+                )?;
                 let instance = Self::instantiate_component(&runtime, &prepared, &mut store)?;
 
                 // Call on_start using the generated typed interface
@@ -681,7 +814,21 @@ impl WasmChannel {
         .await;
 
         match result {
-            Ok(Ok((config, _host_state))) => {
+            Ok(Ok((config, mut host_state))) => {
+                // Surface WASM guest logs (errors/warnings from webhook setup, etc.)
+                for entry in host_state.take_logs() {
+                    match entry.level {
+                        crate::tools::wasm::LogLevel::Error => {
+                            tracing::error!(channel = %self.name, "{}", entry.message);
+                        }
+                        crate::tools::wasm::LogLevel::Warn => {
+                            tracing::warn!(channel = %self.name, "{}", entry.message);
+                        }
+                        _ => {
+                            tracing::debug!(channel = %self.name, "{}", entry.message);
+                        }
+                    }
+                }
                 tracing::info!(
                     channel = %self.name,
                     display_name = %config.display_name,
@@ -753,6 +900,7 @@ impl WasmChannel {
         let capabilities = self.capabilities.clone();
         let timeout = self.runtime.config().callback_timeout;
         let credentials = self.get_credentials().await;
+        let pairing_store = self.pairing_store.clone();
 
         // Prepare request data
         let method = method.to_string();
@@ -766,8 +914,13 @@ impl WasmChannel {
         // Execute in blocking task with timeout
         let result = tokio::time::timeout(timeout, async move {
             tokio::task::spawn_blocking(move || {
-                let mut store =
-                    Self::create_store(&runtime, &prepared, &capabilities, credentials)?;
+                let mut store = Self::create_store(
+                    &runtime,
+                    &prepared,
+                    &capabilities,
+                    credentials,
+                    pairing_store,
+                )?;
                 let instance = Self::instantiate_component(&runtime, &prepared, &mut store)?;
 
                 // Build the WIT request type
@@ -840,12 +993,18 @@ impl WasmChannel {
         let timeout = self.runtime.config().callback_timeout;
         let channel_name = self.name.clone();
         let credentials = self.get_credentials().await;
+        let pairing_store = self.pairing_store.clone();
 
         // Execute in blocking task with timeout
         let result = tokio::time::timeout(timeout, async move {
             tokio::task::spawn_blocking(move || {
-                let mut store =
-                    Self::create_store(&runtime, &prepared, &capabilities, credentials)?;
+                let mut store = Self::create_store(
+                    &runtime,
+                    &prepared,
+                    &capabilities,
+                    credentials,
+                    pairing_store,
+                )?;
                 let instance = Self::instantiate_component(&runtime, &prepared, &mut store)?;
 
                 // Call on_poll using the generated typed interface
@@ -929,6 +1088,7 @@ impl WasmChannel {
         let timeout = self.runtime.config().callback_timeout;
         let channel_name = self.name.clone();
         let credentials = self.get_credentials().await;
+        let pairing_store = self.pairing_store.clone();
 
         // Prepare response data
         let message_id_str = message_id.to_string();
@@ -942,8 +1102,13 @@ impl WasmChannel {
         let result = tokio::time::timeout(timeout, async move {
             tokio::task::spawn_blocking(move || {
                 tracing::info!("Creating WASM store for on_respond");
-                let mut store =
-                    Self::create_store(&runtime, &prepared, &capabilities, credentials)?;
+                let mut store = Self::create_store(
+                    &runtime,
+                    &prepared,
+                    &capabilities,
+                    credentials,
+                    pairing_store,
+                )?;
 
                 tracing::info!("Instantiating WASM component for on_respond");
                 let instance = Self::instantiate_component(&runtime, &prepared, &mut store)?;
@@ -1036,13 +1201,19 @@ impl WasmChannel {
         let timeout = self.runtime.config().callback_timeout;
         let channel_name = self.name.clone();
         let credentials = self.get_credentials().await;
+        let pairing_store = self.pairing_store.clone();
 
         let wit_update = status_to_wit(status, metadata);
 
         let result = tokio::time::timeout(timeout, async move {
             tokio::task::spawn_blocking(move || {
-                let mut store =
-                    Self::create_store(&runtime, &prepared, &capabilities, credentials)?;
+                let mut store = Self::create_store(
+                    &runtime,
+                    &prepared,
+                    &capabilities,
+                    credentials,
+                    pairing_store,
+                )?;
                 let instance = Self::instantiate_component(&runtime, &prepared, &mut store)?;
 
                 let channel_iface = instance.near_agent_channel();
@@ -1080,12 +1251,14 @@ impl WasmChannel {
     ///
     /// Static method for use by the background typing repeat task (which
     /// doesn't have access to `&self`).
+    #[allow(clippy::too_many_arguments)]
     async fn execute_status(
         channel_name: &str,
         runtime: &Arc<WasmChannelRuntime>,
         prepared: &Arc<PreparedChannelModule>,
         capabilities: &ChannelCapabilities,
         credentials: &RwLock<HashMap<String, String>>,
+        pairing_store: Arc<PairingStore>,
         timeout: Duration,
         wit_update: wit_channel::StatusUpdate,
     ) -> Result<(), WasmChannelError> {
@@ -1101,8 +1274,13 @@ impl WasmChannel {
 
         let result = tokio::time::timeout(timeout, async move {
             tokio::task::spawn_blocking(move || {
-                let mut store =
-                    Self::create_store(&runtime, &prepared, &capabilities, credentials_snapshot)?;
+                let mut store = Self::create_store(
+                    &runtime,
+                    &prepared,
+                    &capabilities,
+                    credentials_snapshot,
+                    pairing_store,
+                )?;
                 let instance = Self::instantiate_component(&runtime, &prepared, &mut store)?;
 
                 let channel_iface = instance.near_agent_channel();
@@ -1170,6 +1348,7 @@ impl WasmChannel {
                 let prepared = Arc::clone(&self.prepared);
                 let capabilities = self.capabilities.clone();
                 let credentials = self.credentials.clone();
+                let pairing_store = self.pairing_store.clone();
                 let callback_timeout = self.runtime.config().callback_timeout;
                 let wit_update = status_to_wit(&status, metadata);
 
@@ -1189,6 +1368,7 @@ impl WasmChannel {
                             &prepared,
                             &capabilities,
                             &credentials,
+                            pairing_store.clone(),
                             callback_timeout,
                             wit_update_clone,
                         )
@@ -1319,6 +1499,7 @@ impl WasmChannel {
         let message_tx = self.message_tx.clone();
         let rate_limiter = self.rate_limiter.clone();
         let credentials = self.credentials.clone();
+        let pairing_store = self.pairing_store.clone();
         let callback_timeout = self.runtime.config().callback_timeout;
 
         tokio::spawn(async move {
@@ -1340,14 +1521,15 @@ impl WasmChannel {
                             &prepared,
                             &capabilities,
                             &credentials,
+                            pairing_store.clone(),
                             callback_timeout,
                         ).await;
 
                         match result {
                             Ok(emitted_messages) => {
                                 // Process any emitted messages
-                                if !emitted_messages.is_empty() {
-                                    if let Err(e) = Self::dispatch_emitted_messages(
+                                if !emitted_messages.is_empty()
+                                    && let Err(e) = Self::dispatch_emitted_messages(
                                         &channel_name,
                                         emitted_messages,
                                         &message_tx,
@@ -1359,7 +1541,6 @@ impl WasmChannel {
                                             "Failed to dispatch emitted messages from poll"
                                         );
                                     }
-                                }
                             }
                             Err(e) => {
                                 tracing::warn!(
@@ -1391,6 +1572,7 @@ impl WasmChannel {
         prepared: &Arc<PreparedChannelModule>,
         capabilities: &ChannelCapabilities,
         credentials: &RwLock<HashMap<String, String>>,
+        pairing_store: Arc<PairingStore>,
         timeout: Duration,
     ) -> Result<Vec<EmittedMessage>, WasmChannelError> {
         // Skip if no WASM bytes (testing mode)
@@ -1411,8 +1593,13 @@ impl WasmChannel {
         // Execute in blocking task with timeout
         let result = tokio::time::timeout(timeout, async move {
             tokio::task::spawn_blocking(move || {
-                let mut store =
-                    Self::create_store(&runtime, &prepared, &capabilities, credentials_snapshot)?;
+                let mut store = Self::create_store(
+                    &runtime,
+                    &prepared,
+                    &capabilities,
+                    credentials_snapshot,
+                    pairing_store,
+                )?;
                 let instance = Self::instantiate_component(&runtime, &prepared, &mut store)?;
 
                 // Call on_poll using the generated typed interface
@@ -1583,22 +1770,22 @@ impl Channel for WasmChannel {
         *self.endpoints.write().await = endpoints;
 
         // Start polling if configured
-        if let Some(poll_config) = &config.poll {
-            if poll_config.enabled {
-                let interval = self
-                    .capabilities
-                    .validate_poll_interval(poll_config.interval_ms)
-                    .map_err(|e| ChannelError::StartupFailed {
-                        name: self.name.clone(),
-                        reason: e,
-                    })?;
+        if let Some(poll_config) = &config.poll
+            && poll_config.enabled
+        {
+            let interval = self
+                .capabilities
+                .validate_poll_interval(poll_config.interval_ms)
+                .map_err(|e| ChannelError::StartupFailed {
+                    name: self.name.clone(),
+                    reason: e,
+                })?;
 
-                // Create shutdown channel for polling and store the sender to keep it alive
-                let (poll_shutdown_tx, poll_shutdown_rx) = oneshot::channel();
-                *self.poll_shutdown_tx.write().await = Some(poll_shutdown_tx);
+            // Create shutdown channel for polling and store the sender to keep it alive
+            let (poll_shutdown_tx, poll_shutdown_rx) = oneshot::channel();
+            *self.poll_shutdown_tx.write().await = Some(poll_shutdown_tx);
 
-                self.start_polling(Duration::from_millis(interval as u64), poll_shutdown_rx);
-            }
+            self.start_polling(Duration::from_millis(interval as u64), poll_shutdown_rx);
         }
 
         tracing::info!(
@@ -1858,6 +2045,29 @@ fn status_to_wit(status: &StatusUpdate, metadata: &serde_json::Value) -> wit_cha
             message: format!("Approval needed: {} - {}", tool_name, description),
             metadata_json,
         },
+        StatusUpdate::JobStarted { job_id, title, .. } => wit_channel::StatusUpdate {
+            status: wit_channel::StatusType::Thinking,
+            message: format!("Job started: {} ({})", title, job_id),
+            metadata_json,
+        },
+        StatusUpdate::AuthRequired { extension_name, .. } => wit_channel::StatusUpdate {
+            status: wit_channel::StatusType::Thinking,
+            message: format!("Auth required: {}", extension_name),
+            metadata_json,
+        },
+        StatusUpdate::AuthCompleted {
+            extension_name,
+            success,
+            ..
+        } => wit_channel::StatusUpdate {
+            status: wit_channel::StatusType::Thinking,
+            message: format!(
+                "Auth {}: {}",
+                if *success { "completed" } else { "failed" },
+                extension_name
+            ),
+            metadata_json,
+        },
     }
 }
 
@@ -1929,6 +2139,7 @@ mod tests {
         PreparedChannelModule, WasmChannelRuntime, WasmChannelRuntimeConfig,
     };
     use crate::channels::wasm::wrapper::{HttpResponse, WasmChannel};
+    use crate::pairing::PairingStore;
     use crate::tools::wasm::ResourceLimits;
 
     fn create_test_channel() -> WasmChannel {
@@ -1944,7 +2155,13 @@ mod tests {
 
         let capabilities = ChannelCapabilities::for_channel("test").with_path("/webhook/test");
 
-        WasmChannel::new(runtime, prepared, capabilities, "{}".to_string())
+        WasmChannel::new(
+            runtime,
+            prepared,
+            capabilities,
+            "{}".to_string(),
+            Arc::new(PairingStore::new()),
+        )
     }
 
     #[test]
@@ -2019,6 +2236,7 @@ mod tests {
             &prepared,
             &capabilities,
             &credentials,
+            Arc::new(PairingStore::new()),
             timeout,
         )
         .await;
@@ -2112,7 +2330,13 @@ mod tests {
             .with_path("/webhook/poll")
             .with_polling(1000);
 
-        let channel = WasmChannel::new(runtime, prepared, capabilities, "{}".to_string());
+        let channel = WasmChannel::new(
+            runtime,
+            prepared,
+            capabilities,
+            "{}".to_string(),
+            Arc::new(PairingStore::new()),
+        );
 
         // Start the channel
         let _stream = channel.start().await.expect("Channel should start");
@@ -2349,5 +2573,127 @@ mod tests {
         assert!(matches!(cloned.status, wit_channel::StatusType::Thinking));
         assert_eq!(cloned.message, "hello");
         assert_eq!(cloned.metadata_json, "{\"a\":1}");
+    }
+
+    #[test]
+    fn test_redact_credentials_replaces_values() {
+        use super::ChannelStoreData;
+
+        let mut creds = std::collections::HashMap::new();
+        creds.insert(
+            "TELEGRAM_BOT_TOKEN".to_string(),
+            "8218490433:AAEZeUxwqZ5OO3mOCXv7fKvpdhDgsmBBNis".to_string(),
+        );
+        creds.insert("OTHER_SECRET".to_string(), "s3cret".to_string());
+
+        let store = ChannelStoreData::new(
+            1024 * 1024,
+            "test",
+            ChannelCapabilities::default(),
+            creds,
+            Arc::new(PairingStore::new()),
+        );
+
+        let error = "HTTP request failed: error sending request for url \
+            (https://api.telegram.org/bot8218490433:AAEZeUxwqZ5OO3mOCXv7fKvpdhDgsmBBNis/getUpdates)";
+
+        let redacted = store.redact_credentials(error);
+
+        assert!(
+            !redacted.contains("8218490433:AAEZeUxwqZ5OO3mOCXv7fKvpdhDgsmBBNis"),
+            "credential value should be redacted"
+        );
+        assert!(
+            redacted.contains("[REDACTED:TELEGRAM_BOT_TOKEN]"),
+            "redacted text should contain placeholder name"
+        );
+        assert!(
+            !redacted.contains("s3cret"),
+            "other credentials should also be redacted"
+        );
+    }
+
+    #[test]
+    fn test_redact_credentials_no_op_without_credentials() {
+        use super::ChannelStoreData;
+
+        let store = ChannelStoreData::new(
+            1024 * 1024,
+            "test",
+            ChannelCapabilities::default(),
+            std::collections::HashMap::new(),
+            Arc::new(PairingStore::new()),
+        );
+
+        let input = "some error message";
+        assert_eq!(store.redact_credentials(input), input);
+    }
+
+    #[test]
+    fn test_redact_credentials_skips_empty_values() {
+        use super::ChannelStoreData;
+
+        let mut creds = std::collections::HashMap::new();
+        creds.insert("EMPTY_TOKEN".to_string(), String::new());
+
+        let store = ChannelStoreData::new(
+            1024 * 1024,
+            "test",
+            ChannelCapabilities::default(),
+            creds,
+            Arc::new(PairingStore::new()),
+        );
+
+        let input = "should not match anything";
+        assert_eq!(store.redact_credentials(input), input);
+    }
+
+    /// Verify that WASM HTTP host functions work using a dedicated
+    /// current-thread runtime inside spawn_blocking.
+    #[tokio::test]
+    async fn test_dedicated_runtime_inside_spawn_blocking() {
+        let result = tokio::task::spawn_blocking(|| {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("failed to build runtime");
+            rt.block_on(async { 42 })
+        })
+        .await
+        .expect("spawn_blocking panicked");
+        assert_eq!(result, 42);
+    }
+
+    /// Verify a real HTTP request works using the dedicated-runtime pattern.
+    /// This catches DNS, TLS, and I/O driver issues that trivial tests miss.
+    #[tokio::test]
+    #[ignore] // requires network
+    async fn test_dedicated_runtime_real_http() {
+        let result = tokio::task::spawn_blocking(|| {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("failed to build runtime");
+            rt.block_on(async {
+                let client = reqwest::Client::builder()
+                    .connect_timeout(std::time::Duration::from_secs(10))
+                    .build()
+                    .expect("failed to build client");
+                let resp = client
+                    .get("https://api.telegram.org/bot000/getMe")
+                    .timeout(std::time::Duration::from_secs(10))
+                    .send()
+                    .await;
+                match resp {
+                    Ok(r) => r.status().as_u16(),
+                    Err(e) if e.is_timeout() => panic!("request timed out: {e}"),
+                    Err(e) => panic!("unexpected error: {e}"),
+                }
+            })
+        })
+        .await
+        .expect("spawn_blocking panicked");
+        // 404 because "000" is not a valid bot token
+        assert_eq!(result, 404);
     }
 }

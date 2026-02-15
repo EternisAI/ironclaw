@@ -10,8 +10,8 @@ use uuid::Uuid;
 use crate::agent::scheduler::WorkerMessage;
 use crate::agent::task::TaskOutput;
 use crate::context::{ContextManager, JobState};
+use crate::db::Database;
 use crate::error::Error;
-use crate::history::Store;
 use crate::llm::{
     ActionPlan, ChatMessage, LlmProvider, Reasoning, ReasoningContext, RespondResult, ToolSelection,
 };
@@ -28,7 +28,7 @@ pub struct WorkerDeps {
     pub llm: Arc<dyn LlmProvider>,
     pub safety: Arc<SafetyLayer>,
     pub tools: Arc<ToolRegistry>,
-    pub store: Option<Arc<Store>>,
+    pub store: Option<Arc<dyn Database>>,
     pub timeout: Duration,
     pub use_planning: bool,
 }
@@ -67,7 +67,7 @@ impl Worker {
         &self.deps.tools
     }
 
-    fn store(&self) -> Option<&Arc<Store>> {
+    fn store(&self) -> Option<&Arc<dyn Database>> {
         self.deps.store.as_ref()
     }
 
@@ -227,11 +227,11 @@ Report when the job is complete or if you encounter issues you cannot resolve."#
             }
 
             // Check for cancellation
-            if let Ok(ctx) = self.context_manager().get_context(self.job_id).await {
-                if ctx.state == JobState::Cancelled {
-                    tracing::info!("Worker for job {} detected cancellation", self.job_id);
-                    return Ok(());
-                }
+            if let Ok(ctx) = self.context_manager().get_context(self.job_id).await
+                && ctx.state == JobState::Cancelled
+            {
+                tracing::info!("Worker for job {} detected cancellation", self.job_id);
+                return Ok(());
             }
 
             iteration += 1;
@@ -248,16 +248,15 @@ Report when the job is complete or if you encounter issues you cannot resolve."#
 
             if selections.is_empty() {
                 // No tools from select_tools, ask LLM directly (may still return tool calls)
-                let respond_result = reasoning.respond_with_tools(reason_ctx).await?;
+                let respond_output = reasoning.respond_with_tools(reason_ctx).await?;
 
-                match respond_result {
+                match respond_output.result {
                     RespondResult::Text(response) => {
-                        // Check for completion keywords
-                        let response_lower = response.to_lowercase();
-                        if response_lower.contains("complete")
-                            || response_lower.contains("finished")
-                            || response_lower.contains("done")
-                        {
+                        // Check for explicit completion phrases. Use word-boundary
+                        // aware checks to avoid false positives like "incomplete",
+                        // "not done", or "unfinished". Only the LLM's own response
+                        // (not tool output) can trigger this.
+                        if crate::util::llm_signals_completion(&response) {
                             self.mark_completed().await?;
                             return Ok(());
                         }
@@ -272,13 +271,24 @@ Report when the job is complete or if you encounter issues you cannot resolve."#
                             ));
                         }
                     }
-                    RespondResult::ToolCalls(tool_calls) => {
+                    RespondResult::ToolCalls {
+                        tool_calls,
+                        content,
+                    } => {
                         // Model returned tool calls - execute them
                         tracing::debug!(
                             "Job {} respond_with_tools returned {} tool calls",
                             self.job_id,
                             tool_calls.len()
                         );
+
+                        // Add assistant message with tool_calls (OpenAI protocol)
+                        reason_ctx
+                            .messages
+                            .push(ChatMessage::assistant_with_tool_calls(
+                                content,
+                                tool_calls.clone(),
+                            ));
 
                         for tc in tool_calls {
                             let result = self.execute_tool(&tc.name, &tc.arguments).await;
@@ -289,6 +299,7 @@ Report when the job is complete or if you encounter issues you cannot resolve."#
                                 parameters: tc.arguments.clone(),
                                 reasoning: String::new(),
                                 alternatives: vec![],
+                                tool_call_id: tc.id.clone(),
                             };
 
                             self.process_tool_result(reason_ctx, &selection, result)
@@ -371,7 +382,7 @@ Report when the job is complete or if you encounter issues you cannot resolve."#
         tools: Arc<ToolRegistry>,
         context_manager: Arc<ContextManager>,
         safety: Arc<SafetyLayer>,
-        store: Option<Arc<Store>>,
+        store: Option<Arc<dyn Database>>,
         job_id: Uuid,
         tool_name: &str,
         params: &serde_json::Value,
@@ -417,13 +428,50 @@ Report when the job is complete or if you encounter issues you cannot resolve."#
             .into());
         }
 
-        // Execute with timeout and timing
+        tracing::debug!(
+            tool = %tool_name,
+            params = %params,
+            job = %job_id,
+            "Tool call started"
+        );
+
+        // Execute with per-tool timeout and timing
+        let tool_timeout = tool.execution_timeout();
         let start = std::time::Instant::now();
-        let result = tokio::time::timeout(Duration::from_secs(60), async {
+        let result = tokio::time::timeout(tool_timeout, async {
             tool.execute(params.clone(), &job_ctx).await
         })
         .await;
         let elapsed = start.elapsed();
+
+        match &result {
+            Ok(Ok(output)) => {
+                let result_str = serde_json::to_string(&output.result)
+                    .unwrap_or_else(|_| "<serialize error>".to_string());
+                tracing::debug!(
+                    tool = %tool_name,
+                    elapsed_ms = elapsed.as_millis() as u64,
+                    result = %result_str,
+                    "Tool call succeeded"
+                );
+            }
+            Ok(Err(e)) => {
+                tracing::debug!(
+                    tool = %tool_name,
+                    elapsed_ms = elapsed.as_millis() as u64,
+                    error = %e,
+                    "Tool call failed"
+                );
+            }
+            Err(_) => {
+                tracing::debug!(
+                    tool = %tool_name,
+                    elapsed_ms = elapsed.as_millis() as u64,
+                    timeout_secs = tool_timeout.as_secs(),
+                    "Tool call timed out"
+                );
+            }
+        }
 
         // Record action in memory and get the ActionRecord for persistence
         let action = match &result {
@@ -479,7 +527,7 @@ Report when the job is complete or if you encounter issues you cannot resolve."#
         let output = result
             .map_err(|_| crate::error::ToolError::Timeout {
                 name: tool_name.to_string(),
-                timeout: Duration::from_secs(60),
+                timeout: tool_timeout,
             })?
             .map_err(|e| crate::error::ToolError::ExecutionFailed {
                 name: tool_name.to_string(),
@@ -518,17 +566,14 @@ Report when the job is complete or if you encounter issues you cannot resolve."#
                 );
 
                 reason_ctx.messages.push(ChatMessage::tool_result(
-                    "tool_call_id",
+                    &selection.tool_call_id,
                     &selection.tool_name,
                     wrapped,
                 ));
 
-                // Check if job is complete
-                if output.contains("TASK_COMPLETE") || output.contains("JOB_DONE") {
-                    self.mark_completed().await?;
-                    return Ok(true);
-                }
-
+                // Tool output never drives job completion. A malicious tool could
+                // emit "TASK_COMPLETE" to force premature completion. Only the LLM's
+                // own structured response (in execution_loop) can mark a job done.
                 Ok(false)
             }
             Err(e) => {
@@ -553,7 +598,7 @@ Report when the job is complete or if you encounter issues you cannot resolve."#
                 }
 
                 reason_ctx.messages.push(ChatMessage::tool_result(
-                    "tool_call_id",
+                    &selection.tool_call_id,
                     &selection.tool_name,
                     format!("Error: {}", e),
                 ));
@@ -603,12 +648,15 @@ Report when the job is complete or if you encounter issues you cannot resolve."#
                 .execute_tool(&action.tool_name, &action.parameters)
                 .await;
 
-            // Create a synthetic ToolSelection for process_tool_result
+            // Create a synthetic ToolSelection for process_tool_result.
+            // Plan actions don't originate from an LLM tool_call response so
+            // there is no real tool_call_id; generate a unique one.
             let selection = ToolSelection {
                 tool_name: action.tool_name.clone(),
                 parameters: action.parameters.clone(),
                 reasoning: action.reasoning.clone(),
                 alternatives: vec![],
+                tool_call_id: format!("plan_{}_{}", self.job_id, i),
             };
 
             // Process the result
@@ -632,11 +680,7 @@ Report when the job is complete or if you encounter issues you cannot resolve."#
         let response = reasoning.respond(reason_ctx).await?;
         reason_ctx.messages.push(ChatMessage::assistant(&response));
 
-        let response_lower = response.to_lowercase();
-        if response_lower.contains("complete")
-            || response_lower.contains("finished")
-            || response_lower.contains("done")
-        {
+        if crate::util::llm_signals_completion(&response) {
             self.mark_completed().await?;
         } else {
             // Job not complete, could re-plan or fall back to direct selection
@@ -729,5 +773,88 @@ impl From<TaskOutput> for Result<String, Error> {
             }
             .into()
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::llm::ToolSelection;
+    use crate::util::llm_signals_completion;
+
+    #[test]
+    fn test_tool_selection_preserves_call_id() {
+        let selection = ToolSelection {
+            tool_name: "memory_search".to_string(),
+            parameters: serde_json::json!({"query": "test"}),
+            reasoning: "Need to search memory".to_string(),
+            alternatives: vec![],
+            tool_call_id: "call_abc123".to_string(),
+        };
+
+        assert_eq!(selection.tool_call_id, "call_abc123");
+        assert_ne!(
+            selection.tool_call_id, "tool_call_id",
+            "tool_call_id must not be the hardcoded placeholder string"
+        );
+    }
+
+    #[test]
+    fn test_completion_positive_signals() {
+        assert!(llm_signals_completion("The job is complete."));
+        assert!(llm_signals_completion(
+            "I have completed the task successfully."
+        ));
+        assert!(llm_signals_completion("The task is done."));
+        assert!(llm_signals_completion("The task is finished."));
+        assert!(llm_signals_completion(
+            "All steps are complete and verified."
+        ));
+        assert!(llm_signals_completion(
+            "I've done all the work. The work is done."
+        ));
+        assert!(llm_signals_completion(
+            "Successfully completed the migration."
+        ));
+    }
+
+    #[test]
+    fn test_completion_negative_signals_block_false_positives() {
+        // These contain completion keywords but also negation, should NOT trigger.
+        assert!(!llm_signals_completion("The task is not complete yet."));
+        assert!(!llm_signals_completion("This is not done."));
+        assert!(!llm_signals_completion("The work is incomplete."));
+        assert!(!llm_signals_completion(
+            "The migration is not yet finished."
+        ));
+        assert!(!llm_signals_completion("The job isn't done yet."));
+        assert!(!llm_signals_completion("This remains unfinished."));
+    }
+
+    #[test]
+    fn test_completion_does_not_match_bare_substrings() {
+        // Bare words embedded in other text should NOT trigger completion.
+        assert!(!llm_signals_completion(
+            "I need to complete more work first."
+        ));
+        assert!(!llm_signals_completion(
+            "Let me finish the remaining steps."
+        ));
+        assert!(!llm_signals_completion(
+            "I'm done analyzing, now let me fix it."
+        ));
+        assert!(!llm_signals_completion(
+            "I completed step 1 but step 2 remains."
+        ));
+    }
+
+    #[test]
+    fn test_completion_tool_output_injection() {
+        // A malicious tool output echoed by the LLM should not trigger
+        // completion unless it forms a genuine completion phrase.
+        assert!(!llm_signals_completion("TASK_COMPLETE"));
+        assert!(!llm_signals_completion("JOB_DONE"));
+        assert!(!llm_signals_completion(
+            "The tool returned: TASK_COMPLETE signal"
+        ));
     }
 }
