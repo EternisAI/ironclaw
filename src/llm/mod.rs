@@ -96,7 +96,7 @@ fn create_openai_provider(config: &LlmConfig) -> Result<Arc<dyn LlmProvider>, Ll
             reason: format!("Failed to create OpenAI client: {}", e),
         })?;
 
-    let model = client.completion_model(&oai.model);
+    let model = client.completions_api().completion_model(&oai.model);
     tracing::info!("Using OpenAI direct API (model: {})", oai.model);
     Ok(Arc::new(RigAdapter::new(model, &oai.model)))
 }
@@ -175,7 +175,7 @@ fn create_openai_compatible_provider(config: &LlmConfig) -> Result<Arc<dyn LlmPr
             reason: format!("Failed to create OpenAI-compatible client: {}", e),
         })?;
 
-    let model = client.completion_model(&compat.model);
+    let model = client.completions_api().completion_model(&compat.model);
     tracing::info!(
         "Using OpenAI-compatible endpoint (base_url: {}, model: {})",
         compat.base_url,
