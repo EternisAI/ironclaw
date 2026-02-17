@@ -15,7 +15,7 @@ use tokio::sync::{Mutex, broadcast};
 use uuid::Uuid;
 
 use crate::channels::web::types::SseEvent;
-use crate::history::Store;
+use crate::db::Database;
 use crate::llm::{CompletionRequest, LlmProvider, ToolCompletionRequest};
 use crate::orchestrator::auth::{TokenStore, worker_auth_middleware};
 use crate::orchestrator::job_manager::ContainerJobManager;
@@ -44,7 +44,7 @@ pub struct OrchestratorState {
     /// Buffered follow-up prompts for sandbox jobs, keyed by job_id.
     pub prompt_queue: Arc<Mutex<HashMap<Uuid, VecDeque<PendingPrompt>>>>,
     /// Database handle for persisting job events.
-    pub store: Option<Arc<Store>>,
+    pub store: Option<Arc<dyn Database>>,
     /// Encrypted secrets store for credential injection into containers.
     pub secrets_store: Option<Arc<dyn SecretsStore + Send + Sync>>,
     /// User ID for secret lookups (single-tenant, typically "default").
@@ -214,7 +214,7 @@ async fn report_complete(
     State(state): State<OrchestratorState>,
     Path(job_id): Path<Uuid>,
     Json(report): Json<CompletionReport>,
-) -> Result<StatusCode, StatusCode> {
+) -> Result<Json<serde_json::Value>, StatusCode> {
     if report.success {
         tracing::info!(
             job_id = %job_id,
@@ -237,7 +237,7 @@ async fn report_complete(
         tracing::error!(job_id = %job_id, "Failed to complete job cleanup: {}", e);
     }
 
-    Ok(StatusCode::OK)
+    Ok(Json(serde_json::json!({"status": "ok"})))
 }
 
 // -- Sandbox job event handlers --

@@ -17,11 +17,12 @@ use uuid::Uuid;
 use crate::channels::IncomingMessage;
 use crate::channels::web::types::SseEvent;
 use crate::context::{ContextManager, JobContext, JobState};
-use crate::history::{SandboxJobRecord, Store};
+use crate::db::Database;
+use crate::history::SandboxJobRecord;
 use crate::orchestrator::auth::CredentialGrant;
 use crate::orchestrator::job_manager::{ContainerJobManager, JobMode};
 use crate::secrets::SecretsStore;
-use crate::tools::tool::{Tool, ToolError, ToolOutput};
+use crate::tools::tool::{Tool, ToolError, ToolOutput, require_str};
 
 /// Tool for creating a new job.
 ///
@@ -31,7 +32,7 @@ use crate::tools::tool::{Tool, ToolError, ToolOutput};
 pub struct CreateJobTool {
     context_manager: Arc<ContextManager>,
     job_manager: Option<Arc<ContainerJobManager>>,
-    store: Option<Arc<Store>>,
+    store: Option<Arc<dyn Database>>,
     /// Broadcast sender for job events (used to subscribe a monitor).
     event_tx: Option<tokio::sync::broadcast::Sender<(Uuid, SseEvent)>>,
     /// Injection channel for pushing messages into the agent loop.
@@ -56,7 +57,7 @@ impl CreateJobTool {
     pub fn with_sandbox(
         mut self,
         job_manager: Arc<ContainerJobManager>,
-        store: Option<Arc<Store>>,
+        store: Option<Arc<dyn Database>>,
     ) -> Self {
         self.job_manager = Some(job_manager);
         self.store = store;
@@ -644,17 +645,9 @@ impl Tool for CreateJobTool {
         params: serde_json::Value,
         ctx: &JobContext,
     ) -> Result<ToolOutput, ToolError> {
-        let title = params
-            .get("title")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| ToolError::InvalidParameters("missing 'title' parameter".into()))?;
+        let title = require_str(&params, "title")?;
 
-        let description = params
-            .get("description")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| {
-                ToolError::InvalidParameters("missing 'description' parameter".into())
-            })?;
+        let description = require_str(&params, "description")?;
 
         if self.sandbox_enabled() {
             let wait = params.get("wait").and_then(|v| v.as_bool()).unwrap_or(true);
@@ -821,10 +814,7 @@ impl Tool for JobStatusTool {
         let start = std::time::Instant::now();
         let requester_id = ctx.user_id.clone();
 
-        let job_id_str = params
-            .get("job_id")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| ToolError::InvalidParameters("missing 'job_id' parameter".into()))?;
+        let job_id_str = require_str(&params, "job_id")?;
 
         let job_id = Uuid::parse_str(job_id_str).map_err(|_| {
             ToolError::InvalidParameters(format!("invalid job ID format: {}", job_id_str))
@@ -906,10 +896,7 @@ impl Tool for CancelJobTool {
         let start = std::time::Instant::now();
         let requester_id = ctx.user_id.clone();
 
-        let job_id_str = params
-            .get("job_id")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| ToolError::InvalidParameters("missing 'job_id' parameter".into()))?;
+        let job_id_str = require_str(&params, "job_id")?;
 
         let job_id = Uuid::parse_str(job_id_str).map_err(|_| {
             ToolError::InvalidParameters(format!("invalid job ID format: {}", job_id_str))
@@ -963,12 +950,12 @@ impl Tool for CancelJobTool {
 /// Lets the main agent inspect what a running (or completed) container job has
 /// been doing: messages, tool calls, results, status changes, etc.
 pub struct JobEventsTool {
-    store: Arc<Store>,
+    store: Arc<dyn Database>,
     context_manager: Arc<ContextManager>,
 }
 
 impl JobEventsTool {
-    pub fn new(store: Arc<Store>, context_manager: Arc<ContextManager>) -> Self {
+    pub fn new(store: Arc<dyn Database>, context_manager: Arc<ContextManager>) -> Self {
         Self {
             store,
             context_manager,
