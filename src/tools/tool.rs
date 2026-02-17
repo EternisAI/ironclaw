@@ -172,6 +172,18 @@ pub trait Tool: Send + Sync {
         false
     }
 
+    /// Whether this specific invocation requires explicit approval, given the parameters.
+    ///
+    /// Override this to inspect tool arguments and force per-invocation approval
+    /// even when the user has chosen "always approve" for this tool. For example,
+    /// ShellTool overrides this to require approval for destructive commands like
+    /// `rm -rf` or `git push --force`.
+    ///
+    /// The default implementation delegates to `requires_approval()`.
+    fn requires_approval_for(&self, _params: &serde_json::Value) -> bool {
+        self.requires_approval()
+    }
+
     /// Maximum time this tool is allowed to run before the caller kills it.
     /// Override for long-running tools like sandbox execution.
     /// Default: 60 seconds.
@@ -329,5 +341,13 @@ mod tests {
         let params = serde_json::json!({});
         let err = require_param(&params, "data").unwrap_err();
         assert!(err.to_string().contains("missing 'data'"));
+    }
+
+    #[test]
+    fn test_requires_approval_for_default() {
+        let tool = EchoTool;
+        // EchoTool.requires_approval() returns false, so requires_approval_for
+        // should also return false (default delegates to requires_approval).
+        assert!(!tool.requires_approval_for(&serde_json::json!({"message": "hi"})));
     }
 }
