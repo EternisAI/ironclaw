@@ -19,6 +19,35 @@
 
 ---
 
+## EternisAI Fork
+
+This is a fork of [nearai/ironclaw](https://github.com/nearai/ironclaw) maintained by EternisAI for use in the [Silo Claw](https://github.com/EternisAI/silo-claw-server) platform.
+
+### Changes from upstream
+
+**Fix: Use Chat Completions API instead of Responses API** (`src/llm/mod.rs`)
+
+rig-core 0.30 changed the default `openai::Client` to use the Responses API internally. This causes a panic when used with endpoints that only support Chat Completions (e.g. OpenRouter, any non-OpenAI provider):
+
+```
+thread 'main' panicked at 'The tool call ID should exist!'
+  → rig-core 0.30.0, providers/openai/responses_api/mod.rs:415
+```
+
+The panic occurs on the second turn of any conversation involving tool calls, because the Responses API code path expects `call_id` fields that Chat Completions responses don't provide.
+
+**Fix:** Call `.completions_api()` before `.completion_model()` in both `create_openai_provider()` and `create_openai_compatible_provider()` to force the Chat Completions code path:
+
+```rust
+// Before (panics with non-OpenAI providers):
+let model = client.completion_model(&model_name);
+
+// After (works with all providers):
+let model = client.completions_api().completion_model(&model_name);
+```
+
+---
+
 ## Philosophy
 
 IronClaw is built on a simple principle: **your AI assistant should work for you, not against you**.
