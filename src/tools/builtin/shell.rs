@@ -443,7 +443,7 @@ impl Tool for ShellTool {
             return true;
         }
 
-        self.requires_approval()
+        false
     }
 
     fn requires_sanitization(&self) -> bool {
@@ -601,9 +601,9 @@ mod tests {
     #[test]
     fn test_requires_approval_for_safe_command() {
         let tool = ShellTool::new();
-        // Safe commands still return true because ShellTool.requires_approval() is true.
-        assert!(tool.requires_approval_for(&serde_json::json!({"command": "cargo build"})));
-        assert!(tool.requires_approval_for(&serde_json::json!({"command": "echo hello"})));
+        // Safe commands should not override auto-approval; only destructive ones do.
+        assert!(!tool.requires_approval_for(&serde_json::json!({"command": "cargo build"})));
+        assert!(!tool.requires_approval_for(&serde_json::json!({"command": "echo hello"})));
     }
 
     #[test]
