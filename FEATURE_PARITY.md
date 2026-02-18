@@ -423,12 +423,12 @@ This document tracks feature parity between IronClaw (Rust implementation) and O
 - ❌ Hooks system (beforeInbound, beforeToolCall, etc.)
 
 ### P2 - Medium Priority
-- ❌ Cron job scheduling
-- ❌ Web Control UI
-- ❌ WebChat channel
+- ✅ Cron job scheduling (routines with cron trigger)
+- ✅ Web Control UI (browser dashboard with chat, memory, jobs, logs, extensions)
+- ✅ WebChat channel (web gateway with SSE/WebSocket)
 - 🚧 Media handling (caption support; no image/PDF processing)
-- ❌ CLI subcommands (config, status, memory, doctor)
-- ❌ Ollama/local model support
+- ✅ CLI subcommands (config, status, memory, pairing, tool)
+- ✅ Ollama/local model support (via rig-core)
 - ❌ Configuration hot-reload
 - ❌ Webhook trigger endpoint in web gateway
 

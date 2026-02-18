@@ -72,7 +72,7 @@ IronClaw is the AI assistant you can actually trust with your personal and profe
 
 ### Always Available
 
-- **Multi-channel** - REPL, HTTP webhooks, WASM channels (Telegram, Slack), and web gateway
+- **Multi-channel** - REPL, HTTP webhooks, WASM channels (Telegram, Slack, Discord), and web gateway
 - **Docker Sandbox** - Isolated container execution with per-job tokens and orchestrator/worker pattern
 - **Web Gateway** - Browser UI with real-time SSE/WebSocket streaming
 - **Routines** - Cron schedules, event triggers, webhook handlers for background automation
@@ -96,9 +96,9 @@ IronClaw is the AI assistant you can actually trust with your personal and profe
 
 ### Prerequisites
 
-- Rust 1.85+
-- PostgreSQL 15+ with [pgvector](https://github.com/pgvector/pgvector) extension
-- NEAR AI account (authentication handled via setup wizard)
+- Rust 1.92+ (edition 2024)
+- PostgreSQL 15+ with [pgvector](https://github.com/pgvector/pgvector) extension (or libSQL/Turso for zero-dependency local mode)
+- An LLM provider: NEAR AI account (via setup wizard), OpenAI API key, Ollama, or any OpenAI-compatible endpoint
 
 ## Download or Build
 
@@ -290,10 +290,16 @@ cargo test
 
 # Run specific test
 cargo test test_name
+
+# Feature-flag testing (required when touching feature-gated code)
+cargo check                                          # default features
+cargo check --no-default-features --features libsql  # libsql only
+cargo check --all-features                           # all features
 ```
 
 - **Telegram channel**: See [docs/TELEGRAM_SETUP.md](docs/TELEGRAM_SETUP.md) for setup and DM pairing.
 - **Changing channel sources**: Run `./channels-src/telegram/build.sh` before `cargo build` so the updated WASM is bundled.
+- **Agent/AI guidance**: See [AGENTS.md](AGENTS.md) for code conventions and [CLAUDE.md](CLAUDE.md) for full architecture details.
 
 ## OpenClaw Heritage
 

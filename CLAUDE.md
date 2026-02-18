@@ -11,7 +11,7 @@
 - **Always available** - Multi-channel access with proactive background execution
 
 ### Features
-- **Multi-channel input**: TUI (Ratatui), HTTP webhooks, WASM channels (Telegram, Slack), web gateway
+- **Multi-channel input**: REPL, HTTP webhooks, WASM channels (Telegram, Slack, Discord), web gateway
 - **Parallel job execution** with state machine and self-repair for stuck jobs
 - **Sandbox execution**: Docker container isolation with orchestrator/worker pattern
 - **Claude Code mode**: Delegate jobs to Claude CLI inside containers
@@ -48,8 +48,12 @@ RUST_LOG=ironclaw=debug cargo run
 src/
 ├── lib.rs              # Library root, module declarations
 ├── main.rs             # Entry point, CLI args, startup
+├── bootstrap.rs        # Application bootstrap/initialization
 ├── config.rs           # Configuration from env vars
+├── settings.rs         # Persistent settings management
 ├── error.rs            # Error types (thiserror)
+├── tracing_fmt.rs      # Custom tracing/logging formatter
+├── util.rs             # Shared utility functions
 │
 ├── agent/              # Core agent logic
 │   ├── agent_loop.rs   # Main Agent struct, message handling loop
@@ -71,15 +75,9 @@ src/
 ├── channels/           # Multi-channel input
 │   ├── channel.rs      # Channel trait, IncomingMessage, OutgoingResponse
 │   ├── manager.rs      # ChannelManager merges streams
-│   ├── cli/            # Full TUI with Ratatui
-│   │   ├── mod.rs      # TuiChannel implementation
-│   │   ├── app.rs      # Application state
-│   │   ├── render.rs   # UI rendering
-│   │   ├── events.rs   # Input handling
-│   │   ├── overlay.rs  # Approval overlays
-│   │   └── composer.rs # Message composition
 │   ├── http.rs         # HTTP webhook (axum) with secret validation
 │   ├── repl.rs         # Simple REPL (for testing)
+│   ├── webhook_server.rs # Unified webhook server
 │   ├── web/            # Web gateway (browser UI)
 │   │   ├── mod.rs      # Gateway builder, startup
 │   │   ├── server.rs   # Axum router, 40+ API endpoints
@@ -87,18 +85,50 @@ src/
 │   │   ├── ws.rs       # WebSocket gateway + connection tracking
 │   │   ├── types.rs    # Request/response types, SseEvent enum
 │   │   ├── auth.rs     # Bearer token auth middleware
+│   │   ├── openai_compat.rs # OpenAI-compatible /v1/chat/completions API
 │   │   ├── log_layer.rs # Tracing layer for log streaming
 │   │   └── static/     # HTML, CSS, JS (single-page app)
 │   └── wasm/           # WASM channel runtime
 │       ├── mod.rs
 │       ├── bundled.rs  # Bundled channel discovery
+│       ├── capabilities.rs # Channel capability declarations
+│       ├── error.rs    # WASM channel error types
+│       ├── host.rs     # Host function bindings
+│       ├── loader.rs   # WASM channel module loading
+│       ├── router.rs   # Channel message routing
+│       ├── runtime.rs  # WASM runtime initialization
+│       ├── schema.rs   # Schema definitions for channel interface
 │       └── wrapper.rs  # Channel trait wrapper for WASM modules
+│
+├── cli/                # CLI subcommands
+│   ├── mod.rs          # CLI command dispatch
+│   ├── config.rs       # `ironclaw config` command
+│   ├── mcp.rs          # `ironclaw mcp` command
+│   ├── memory.rs       # `ironclaw memory` command
+│   ├── oauth_defaults.rs # Default OAuth configurations
+│   ├── pairing.rs      # `ironclaw pairing` command
+│   ├── status.rs       # `ironclaw status` command
+│   └── tool.rs         # `ironclaw tool install/list/remove/auth`
+│
+├── extensions/         # Extension management system
+│   ├── mod.rs          # Extension types and re-exports
+│   ├── discovery.rs    # Extension discovery from filesystem/registry
+│   ├── manager.rs      # Extension lifecycle (install, auth, activate)
+│   └── registry.rs     # Extension registry for tracking installed extensions
 │
 ├── orchestrator/       # Internal HTTP API for sandbox containers
 │   ├── mod.rs
 │   ├── api.rs          # Axum endpoints (LLM proxy, events, prompts)
 │   ├── auth.rs         # Per-job bearer token store
 │   └── job_manager.rs  # Container lifecycle (create, stop, cleanup)
+│
+├── sandbox/            # Docker sandbox configuration
+│   ├── mod.rs
+│   ├── config.rs       # Sandbox configuration
+│   ├── container.rs    # Container management
+│   ├── error.rs        # Sandbox error types
+│   ├── manager.rs      # Sandbox lifecycle management
+│   └── proxy/          # Network proxy for sandboxed containers
 │
 ├── worker/             # Runs inside Docker containers
 │   ├── mod.rs
@@ -107,15 +137,32 @@ src/
 │   ├── api.rs          # HTTP client to orchestrator
 │   └── proxy_llm.rs    # LlmProvider that proxies through orchestrator
 │
+├── setup/              # First-run onboarding wizard
+│   ├── mod.rs
+│   ├── wizard.rs       # Interactive setup flow
+│   ├── channels.rs     # Channel configuration setup
+│   ├── prompts.rs      # User prompt helpers
+│   └── README.md       # Module specification (authoritative)
+│
+├── pairing/            # DM pairing for channel authentication
+│   ├── mod.rs          # Pairing types and logic
+│   └── store.rs        # Pairing code storage
+│
 ├── safety/             # Prompt injection defense
 │   ├── sanitizer.rs    # Pattern detection, content escaping
 │   ├── validator.rs    # Input validation (length, encoding, patterns)
 │   ├── policy.rs       # PolicyRule system with severity/actions
 │   └── leak_detector.rs # Secret detection (API keys, tokens, etc.)
 │
-├── llm/                # LLM integration (NEAR AI only)
+├── llm/                # Multi-provider LLM integration
+│   ├── mod.rs          # Module root, provider construction
 │   ├── provider.rs     # LlmProvider trait, message types
-│   ├── nearai.rs       # NEAR AI chat-api implementation
+│   ├── rig_adapter.rs  # Adapter for rig-core multi-provider support
+│   ├── failover.rs     # FailoverProvider with retry on provider errors
+│   ├── retry.rs        # Retry logic with backoff
+│   ├── costs.rs        # Token cost tracking
+│   ├── nearai.rs       # NEAR AI provider
+│   ├── nearai_chat.rs  # NEAR AI chat-api implementation
 │   ├── reasoning.rs    # Planning, tool selection, evaluation
 │   └── session.rs      # Session token management with auto-renewal
 │
@@ -130,8 +177,7 @@ src/
 │   │   ├── memory.rs   # Memory tools (search, write, read, tree)
 │   │   ├── job.rs      # CreateJob, ListJobs, JobStatus, CancelJob
 │   │   ├── routine.rs  # routine_create/list/update/delete/history
-│   │   ├── extension_tools.rs # Extension install/auth/activate/remove
-│   │   └── marketplace.rs, ecommerce.rs, taskrabbit.rs, restaurant.rs (stubs)
+│   │   └── extension_tools.rs # Extension install/auth/activate/remove
 │   ├── builder/        # Dynamic tool building
 │   │   ├── core.rs     # BuildRequirement, SoftwareType, Language
 │   │   ├── templates.rs # Project scaffolding
@@ -442,14 +488,13 @@ Key test patterns:
 
 ## Current Limitations / TODOs
 
-1. **Domain-specific tools** - `marketplace.rs`, `restaurant.rs`, `taskrabbit.rs`, `ecommerce.rs` return placeholder responses; need real API integrations
-2. **Integration tests** - Need testcontainers setup for PostgreSQL
-3. **MCP stdio transport** - Only HTTP transport implemented
-4. **WIT bindgen integration** - Auto-extract tool description/schema from WASM modules (stubbed)
-5. **Capability granting after tool build** - Built tools get empty capabilities; need UX for granting HTTP/secrets access
-6. **Tool versioning workflow** - No version tracking or rollback for dynamically built tools
-7. **Webhook trigger endpoint** - Routines webhook trigger not yet exposed in web gateway
-8. **Full channel status view** - Gateway status widget exists, but no per-channel connection dashboard
+1. **Integration tests** - Need testcontainers setup for PostgreSQL
+2. **MCP stdio transport** - Only HTTP transport implemented
+3. **WIT bindgen integration** - Auto-extract tool description/schema from WASM modules (stubbed)
+4. **Capability granting after tool build** - Built tools get empty capabilities; need UX for granting HTTP/secrets access
+5. **Tool versioning workflow** - No version tracking or rollback for dynamically built tools
+6. **Webhook trigger endpoint** - Routines webhook trigger not yet exposed in web gateway
+7. **Full channel status view** - Gateway status widget exists, but no per-channel connection dashboard
 
 ### Completed
 
