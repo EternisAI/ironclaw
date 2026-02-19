@@ -1056,6 +1056,13 @@ impl Agent {
         let mut iteration = 0;
         let mut tools_executed = resume_after_tool;
 
+        // If we nudge the LLM to use tools (because it mentioned a tool name
+        // without calling it), we save the original text here.  Should the
+        // nudge turn out to be a false positive (LLM responds with text again
+        // instead of tool calls), we return this saved response rather than the
+        // potentially confused post-nudge one.
+        let mut pre_nudge_response: Option<String> = None;
+
         loop {
             iteration += 1;
             if iteration > MAX_TOOL_ITERATIONS {
@@ -1083,6 +1090,9 @@ impl Agent {
             // Refresh tool definitions each iteration so newly built tools become visible
             let tool_defs = self.tools().tool_definitions().await;
 
+            // Collect tool names before moving tool_defs into the context
+            let tool_names: Vec<String> = tool_defs.iter().map(|t| t.name.clone()).collect();
+
             // Call LLM with current context
             let context = ReasoningContext::new()
                 .with_messages(context_messages.clone())
@@ -1104,22 +1114,39 @@ impl Agent {
 
             match output.result {
                 RespondResult::Text(text) => {
-                    // If no tools have been executed yet, prompt the LLM to use tools
-                    // This handles the case where the model explains what it will do
-                    // instead of actually calling tools
-                    if !tools_executed && iteration < 3 {
+                    // If we already nudged and the LLM still responded with
+                    // text (no tool calls), the nudge was a false positive.
+                    // Return the original pre-nudge response which is the
+                    // genuine reply, uncontaminated by the nudge prompt.
+                    if let Some(original) = pre_nudge_response.take() {
                         tracing::debug!(
-                            "No tools executed yet (iteration {}), prompting for tool use",
-                            iteration
+                            "Post-nudge response is text — returning original pre-nudge response"
                         );
-                        context_messages.push(ChatMessage::assistant(&text));
-                        context_messages.push(ChatMessage::user(
-                            "Please proceed and use the available tools to complete this task.",
-                        ));
-                        continue;
+                        return Ok(AgenticLoopResult::Response(original));
                     }
 
-                    // Tools have been executed or we've tried multiple times, return response
+                    // If the LLM mentions intending to use a tool (e.g. "I'll
+                    // use memory_search to find...") but didn't actually call
+                    // it, give it one chance to proceed.  We only nudge once
+                    // (pre_nudge_response is None) to avoid a loop.
+                    if !tools_executed && iteration < 3 {
+                        let name_refs: Vec<&str> = tool_names.iter().map(|s| s.as_str()).collect();
+                        if crate::util::llm_mentions_tool_intent(&text, &name_refs) {
+                            tracing::debug!(
+                                "LLM mentions tool intent without calling (iteration {}), nudging",
+                                iteration
+                            );
+                            pre_nudge_response = Some(text.clone());
+                            context_messages.push(ChatMessage::assistant(&text));
+                            context_messages.push(ChatMessage::user(
+                                "If you were planning to call any of the available tools, \
+                                 please go ahead and invoke them now.",
+                            ));
+                            continue;
+                        }
+                    }
+
+                    // Conversational response or tools already executed — return as-is
                     return Ok(AgenticLoopResult::Response(text));
                 }
                 RespondResult::ToolCalls {

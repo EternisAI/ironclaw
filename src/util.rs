@@ -16,6 +16,79 @@ pub fn floor_char_boundary(s: &str, pos: usize) -> usize {
     i
 }
 
+/// Check if an LLM response mentions intent to use a specific tool without
+/// actually calling it (i.e., the model is "explaining" instead of "doing").
+///
+/// Returns `true` when the text contains an intent phrase ("I'll use", "let me
+/// call", etc.) followed by a known tool name within a short window. This lets
+/// us nudge the LLM to actually invoke the tool, while allowing plain
+/// conversational responses to pass through without nudging.
+pub fn llm_mentions_tool_intent(response: &str, tool_names: &[&str]) -> bool {
+    if tool_names.is_empty() {
+        return false;
+    }
+
+    let lower = response.to_lowercase();
+
+    // Phrases that signal the LLM intends to invoke a tool but hasn't.
+    const INTENT_PHRASES: &[&str] = &[
+        "i'll use",
+        "i will use",
+        "i'll call",
+        "i will call",
+        "i'll run",
+        "i will run",
+        "i'll invoke",
+        "i will invoke",
+        "i'll execute",
+        "i will execute",
+        "let me use",
+        "let me call",
+        "let me run",
+        "let me invoke",
+        "let me execute",
+        "i need to use",
+        "i need to call",
+        "i need to run",
+        "i should use",
+        "i should call",
+        "i should run",
+        "i'm going to use",
+        "i'm going to call",
+        "i'm going to run",
+        "going to use the",
+        "going to call the",
+        "going to run the",
+        "i can use",
+        "i can call",
+        "i can run",
+        "using the",
+        "by calling",
+        "by running",
+        "by using",
+    ];
+
+    for phrase in INTENT_PHRASES {
+        if let Some(phrase_pos) = lower.find(phrase) {
+            // Look for a tool name within 80 chars after the intent phrase
+            let window_start = phrase_pos + phrase.len();
+            let window_end = (window_start + 80).min(lower.len());
+            let window = &lower[window_start..window_end];
+
+            for tool_name in tool_names {
+                let tool_lower = tool_name.to_lowercase();
+                // Match the tool name, or its underscore-to-space variant
+                // (e.g., "memory_search" matches "memory search")
+                if window.contains(&tool_lower) || window.contains(&tool_lower.replace('_', " ")) {
+                    return true;
+                }
+            }
+        }
+    }
+
+    false
+}
+
 /// Check if an LLM response explicitly signals that a job/task is complete.
 ///
 /// Uses phrase-level matching to avoid false positives from bare words like
@@ -72,7 +145,7 @@ pub fn llm_signals_completion(response: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use crate::util::{floor_char_boundary, llm_signals_completion};
+    use crate::util::{floor_char_boundary, llm_mentions_tool_intent, llm_signals_completion};
 
     // ── floor_char_boundary ──
 
@@ -174,5 +247,103 @@ mod tests {
         assert!(!llm_signals_completion(
             "The tool returned: TASK_COMPLETE signal"
         ));
+    }
+
+    // ── llm_mentions_tool_intent ──
+
+    const TOOLS: &[&str] = &["memory_search", "shell", "create_job", "http"];
+
+    #[test]
+    fn tool_intent_detected() {
+        assert!(llm_mentions_tool_intent(
+            "I'll use memory_search to look that up for you.",
+            TOOLS,
+        ));
+        assert!(llm_mentions_tool_intent(
+            "Let me call the shell tool to check the directory.",
+            TOOLS,
+        ));
+        assert!(llm_mentions_tool_intent(
+            "I will run http to fetch the data.",
+            TOOLS,
+        ));
+        assert!(llm_mentions_tool_intent(
+            "I'm going to use create_job to start that.",
+            TOOLS,
+        ));
+        assert!(llm_mentions_tool_intent(
+            "I should use the memory_search tool first.",
+            TOOLS,
+        ));
+        assert!(llm_mentions_tool_intent(
+            "I can use memory search to find that information.",
+            TOOLS,
+        ));
+    }
+
+    #[test]
+    fn tool_intent_not_detected_conversational() {
+        // Plain greetings / chat
+        assert!(!llm_mentions_tool_intent(
+            "Hello! How can I help you today?",
+            TOOLS
+        ));
+        assert!(!llm_mentions_tool_intent(
+            "I'm doing great, thanks for asking!",
+            TOOLS,
+        ));
+        assert!(!llm_mentions_tool_intent(
+            "The weather has been nice lately.",
+            TOOLS,
+        ));
+        assert!(!llm_mentions_tool_intent(
+            "Sure, I can explain how that works.",
+            TOOLS,
+        ));
+    }
+
+    #[test]
+    fn tool_intent_not_detected_no_tool_name() {
+        // Intent phrase present but no tool name nearby
+        assert!(!llm_mentions_tool_intent(
+            "I'll use my knowledge to answer that.",
+            TOOLS,
+        ));
+        assert!(!llm_mentions_tool_intent(
+            "Let me run through the possibilities.",
+            TOOLS,
+        ));
+        assert!(!llm_mentions_tool_intent(
+            "I'm going to use a different approach.",
+            TOOLS,
+        ));
+    }
+
+    #[test]
+    fn tool_intent_not_detected_empty_tools() {
+        assert!(!llm_mentions_tool_intent(
+            "I'll use memory_search to find that.",
+            &[],
+        ));
+    }
+
+    #[test]
+    fn tool_intent_case_insensitive() {
+        assert!(llm_mentions_tool_intent(
+            "I'll use MEMORY_SEARCH to look that up.",
+            TOOLS,
+        ));
+        assert!(llm_mentions_tool_intent(
+            "Let me call Shell to run the command.",
+            TOOLS,
+        ));
+    }
+
+    #[test]
+    fn tool_intent_tool_name_too_far_away() {
+        // Tool name is >80 chars from the intent phrase
+        let padding = "x".repeat(100);
+        let text = format!("I'll use {} memory_search", padding);
+        assert!(!llm_mentions_tool_intent(&text, TOOLS));
     }
 }
