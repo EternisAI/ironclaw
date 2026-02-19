@@ -8,7 +8,7 @@ on:
 jobs:
   publish:
     name: Build & Push to GHCR
-    runs-on: blacksmith-2vcpu-ubuntu-22.04
+    runs-on: blacksmith-2vcpu-ubuntu-2204
     permissions:
       contents: read
       packages: write
