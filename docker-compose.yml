@@ -1,4 +1,6 @@
-# Local development only — do NOT use these credentials in production.
+# Usage:
+#   docker compose up                    # local dev: postgres + local build
+#   docker compose --profile prod up     # prod: postgres + ghcr.io image
 services:
   postgres:
     image: pgvector/pgvector:pg16
@@ -15,6 +17,26 @@ services:
       interval: 5s
       timeout: 3s
       retries: 5
+
+  ironclaw:
+    build: .
+    ports:
+      - "3000:3000"
+    env_file: .env
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  ironclaw-prod:
+    image: ghcr.io/eternisai/ironclaw:latest
+    platform: linux/amd64
+    profiles: ["prod"]
+    ports:
+      - "3000:3000"
+    env_file: .env
+    depends_on:
+      postgres:
+        condition: service_healthy
 
 volumes:
   pgdata:
