@@ -1154,6 +1154,11 @@ impl Agent {
                     content,
                 } => {
                     tools_executed = true;
+                    // The nudge (if any) succeeded — the model is now calling
+                    // tools.  Discard the stashed pre-nudge text so the final
+                    // text response (which will incorporate tool results) is
+                    // returned instead of the stale original.
+                    pre_nudge_response = None;
 
                     // Add the assistant message with tool_calls to context.
                     // OpenAI protocol requires this before tool-result messages.
