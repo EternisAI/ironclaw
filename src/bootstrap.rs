@@ -1,4 +1,4 @@
-//! Bootstrap helpers for IronClaw.
+//! Bootstrap helpers for SiloClaw.
 //!
 //! The only setting that truly needs disk persistence before the database is
 //! available is `DATABASE_URL` (chicken-and-egg: can't connect to DB without
@@ -8,7 +8,7 @@
 
 use std::path::PathBuf;
 
-/// Path to the IronClaw-specific `.env` file: `~/.ironclaw/.env`.
+/// Path to the SiloClaw-specific `.env` file: `~/.ironclaw/.env`.
 pub fn ironclaw_env_path() -> PathBuf {
     dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("."))

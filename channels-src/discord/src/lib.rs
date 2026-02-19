@@ -1,4 +1,4 @@
-//! Discord Gateway/Webhook channel for IronClaw.
+//! Discord Gateway/Webhook channel for SiloClaw.
 //!
 //! This WASM component implements the channel interface for handling Discord
 //! interactions via webhooks and sending messages back to Discord.

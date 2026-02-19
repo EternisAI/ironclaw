@@ -69,7 +69,7 @@ pub struct SetupConfig {
     pub channels_only: bool,
 }
 
-/// Interactive setup wizard for IronClaw.
+/// Interactive setup wizard for SiloClaw.
 pub struct SetupWizard {
     config: SetupConfig,
     settings: Settings,
@@ -125,7 +125,7 @@ impl SetupWizard {
 
     /// Run the setup wizard.
     pub async fn run(&mut self) -> Result<(), SetupError> {
-        print_header("IronClaw Setup Wizard");
+        print_header("SiloClaw Setup Wizard");
 
         if self.config.channels_only {
             // Channels-only mode: just step 6
@@ -346,7 +346,7 @@ impl SetupWizard {
         }
 
         println!();
-        print_info("IronClaw uses an embedded SQLite database (libSQL).");
+        print_info("SiloClaw uses an embedded SQLite database (libSQL).");
         print_info("No external database server required.");
         println!();
 

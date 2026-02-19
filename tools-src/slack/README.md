@@ -1,6 +1,6 @@
 # Slack WASM Tool
 
-A standalone WASM component that provides Slack integration for IronClaw. This serves as both a functional tool and a template for building custom WASM tools.
+A standalone WASM component that provides Slack integration for SiloClaw. This serves as both a functional tool and a template for building custom WASM tools.
 
 ## Features
 
@@ -88,7 +88,7 @@ VALUES ('your_user_id', 'slack_bot_token', ...);
 {
   "action": "send_message",
   "channel": "#general",
-  "text": "Hello from IronClaw!"
+  "text": "Hello from SiloClaw!"
 }
 ```
 

@@ -1,4 +1,4 @@
-# Multi-stage Dockerfile for the IronClaw agent (cloud deployment).
+# Multi-stage Dockerfile for the SiloClaw agent (cloud deployment).
 #
 # Build:
 #   docker build --platform linux/amd64 -t ironclaw:latest .

@@ -1,4 +1,4 @@
-//! Configuration for IronClaw.
+//! Configuration for SiloClaw.
 //!
 //! Settings are loaded with priority: env var > database > default.
 //! `DATABASE_URL` lives in `~/.ironclaw/.env` (loaded via dotenvy early
@@ -260,7 +260,7 @@ pub fn default_libsql_path() -> PathBuf {
 
 /// Which LLM backend to use.
 ///
-/// Defaults to `NearAi` to keep IronClaw close to the NEAR ecosystem.
+/// Defaults to `NearAi` to keep SiloClaw close to the NEAR ecosystem.
 /// Users can override with `LLM_BACKEND` env var to use their own API keys.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum LlmBackend {

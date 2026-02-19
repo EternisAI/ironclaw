@@ -224,7 +224,7 @@ fn print_help() {
     let r = "\x1b[0m"; // reset
 
     println!();
-    println!("  {h}IronClaw REPL{r}");
+    println!("  {h}SiloClaw REPL{r}");
     println!();
     println!("  {h}Commands{r}");
     println!("  {c}/help{r}              {d}show this help{r}");
@@ -298,7 +298,7 @@ impl Channel for ReplChannel {
             }
             let _ = rl.load_history(&hist_path);
 
-            println!("\x1b[1mIronClaw\x1b[0m  /help for commands, /quit to exit");
+            println!("\x1b[1mSiloClaw\x1b[0m  /help for commands, /quit to exit");
             println!();
 
             loop {

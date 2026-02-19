@@ -21,6 +21,12 @@ pub mod paths {
     pub const USER: &str = "USER.md";
     /// Periodic checklist for heartbeat.
     pub const HEARTBEAT: &str = "HEARTBEAT.md";
+    /// Boot-time automation checklist.
+    pub const BOOT: &str = "BOOT.md";
+    /// First-run bootstrap ritual.
+    pub const BOOTSTRAP: &str = "BOOTSTRAP.md";
+    /// Local environment notes for tools.
+    pub const TOOLS: &str = "TOOLS.md";
     /// Root runbook/readme.
     pub const README: &str = "README.md";
     /// Daily logs directory.

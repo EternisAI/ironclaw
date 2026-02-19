@@ -1,4 +1,4 @@
-//! Gmail WASM Tool for IronClaw.
+//! Gmail WASM Tool for SiloClaw.
 //!
 //! Provides Gmail integration for reading, searching, sending, drafting,
 //! and replying to emails.

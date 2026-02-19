@@ -1,4 +1,4 @@
-//! Google Slides WASM Tool for IronClaw.
+//! Google Slides WASM Tool for SiloClaw.
 //!
 //! Provides Google Slides integration for creating, reading, editing,
 //! and formatting presentations. Use Google Drive tool to search for

@@ -1,4 +1,4 @@
-//! Interactive setup wizard for IronClaw.
+//! Interactive setup wizard for SiloClaw.
 //!
 //! Provides a guided setup experience for:
 //! 1. Database connection

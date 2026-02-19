@@ -1,8 +1,8 @@
-# IronClaw Development Guide
+# SiloClaw Development Guide
 
 ## Project Overview
 
-**IronClaw** is a secure personal AI assistant that protects your data and expands its capabilities on the fly.
+**SiloClaw** is a secure personal AI assistant that protects your data and expands its capabilities on the fly.
 
 ### Core Philosophy
 - **User-first security** - Your data stays yours, encrypted and local
@@ -367,7 +367,7 @@ Session tokens have the format `sess_xxx` (37 characters). They are authenticate
 
 ## Database
 
-IronClaw supports two database backends, selected at compile time via Cargo feature flags and at runtime via the `DATABASE_BACKEND` environment variable.
+SiloClaw supports two database backends, selected at compile time via Cargo feature flags and at runtime via the `DATABASE_BACKEND` environment variable.
 
 **IMPORTANT: All new features that touch persistence MUST support both backends.** Implement the operation as a method on the `Database` trait in `src/db/mod.rs`, then add the implementation in both `src/db/postgres.rs` (delegate to Store/Repository) and `src/db/libsql_backend.rs` (native SQL).
 
@@ -626,7 +626,7 @@ The agent reads auth config from the tool's capabilities file and provides the a
 
 Both are first-class in the extension system (`ironclaw tool install` handles both), but they have different strengths.
 
-**WASM Tools (IronClaw native)**
+**WASM Tools (SiloClaw native)**
 
 - Sandboxed: fuel metering, memory limits, no access except what's allowlisted
 - Credentials injected by host runtime, tool code never sees the actual token
@@ -640,7 +640,7 @@ Both are first-class in the extension system (`ironclaw tool install` handles bo
 - Growing ecosystem of pre-built servers (GitHub, Notion, Postgres, etc.)
 - Any language (TypeScript/Python most common)
 - Can do websockets, streaming, background polling
-- Cost: external process with full system access (no sandbox), manages own credentials, IronClaw can't prevent leaks
+- Cost: external process with full system access (no sandbox), manages own credentials, SiloClaw can't prevent leaks
 
 **Decision guide:**
 

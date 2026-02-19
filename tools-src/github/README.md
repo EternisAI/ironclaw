@@ -1,4 +1,4 @@
-# GitHub Tool for IronClaw
+# GitHub Tool for SiloClaw
 
 WASM tool for GitHub integration - manage repos, issues, PRs, and workflows.
 

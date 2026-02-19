@@ -1,4 +1,4 @@
-# Multi-stage Dockerfile for the IronClaw worker container.
+# Multi-stage Dockerfile for the SiloClaw worker container.
 #
 # This image runs the ironclaw binary in worker mode inside Docker containers.
 # The orchestrator creates instances of this image for sandboxed job execution.

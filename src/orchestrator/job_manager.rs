@@ -18,7 +18,7 @@ use crate::sandbox::connect_docker;
 /// Which mode a sandbox container runs in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JobMode {
-    /// Standard IronClaw worker with proxied LLM calls.
+    /// Standard SiloClaw worker with proxied LLM calls.
     Worker,
     /// Claude Code bridge that spawns the `claude` CLI directly.
     ClaudeCode,

@@ -300,8 +300,9 @@ impl HeartbeatRunner {
 /// saving API costs.
 fn is_effectively_empty(content: &str) -> bool {
     let without_comments = strip_html_comments(content);
+    let without_front_matter = strip_yaml_front_matter(&without_comments);
 
-    without_comments.lines().all(|line| {
+    without_front_matter.lines().all(|line| {
         let trimmed = line.trim();
         trimmed.is_empty()
             || trimmed.starts_with('#')
@@ -310,6 +311,31 @@ fn is_effectively_empty(content: &str) -> bool {
             || trimmed == "-"
             || trimmed == "*"
     })
+}
+
+fn strip_yaml_front_matter(content: &str) -> String {
+    let mut lines = content.lines();
+    let Some(first_line) = lines.next() else {
+        return String::new();
+    };
+
+    if first_line.trim() != "---" {
+        return content.to_string();
+    }
+
+    let mut out = String::new();
+    let mut in_front_matter = true;
+    for line in lines {
+        if in_front_matter {
+            if line.trim() == "---" {
+                in_front_matter = false;
+            }
+            continue;
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    out
 }
 
 /// Remove HTML comments from content.
@@ -440,16 +466,19 @@ mod tests {
     #[test]
     fn test_effectively_empty_seeded_template() {
         let template = "\
-# Heartbeat Checklist
+---
+title: \"HEARTBEAT.md Template\"
+summary: \"Workspace template for HEARTBEAT.md\"
+read_when:
+  - Bootstrapping a workspace manually
+---
 
-<!-- Keep this file empty to skip heartbeat API calls.
-     Add tasks below when you want the agent to check something periodically.
+# HEARTBEAT.md
 
-     Example:
-     - [ ] Check for unread emails needing a reply
-     - [ ] Review today's calendar for upcoming meetings
-     - [ ] Check CI build status for main branch
--->";
+# Keep this file empty (or with only comments) to skip heartbeat API calls.
+
+# Add tasks below when you want the agent to check something periodically.
+";
         assert!(is_effectively_empty(template));
     }
 

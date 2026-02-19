@@ -1,4 +1,4 @@
-//! Google Calendar WASM Tool for IronClaw.
+//! Google Calendar WASM Tool for SiloClaw.
 //!
 //! Provides Google Calendar integration for viewing, creating, updating,
 //! and deleting calendar events.

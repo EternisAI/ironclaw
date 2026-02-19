@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# VM bootstrap script for IronClaw on GCP Compute Engine.
+# VM bootstrap script for SiloClaw on GCP Compute Engine.
 #
 # Run on a fresh Debian 12 VM after SSH:
 #   sudo bash setup.sh
@@ -49,13 +49,13 @@ chmod 700 /opt/ironclaw
 
 if [ ! -f /opt/ironclaw/.env ]; then
   echo "WARNING: /opt/ironclaw/.env does not exist."
-  echo "Create it with your configuration before starting IronClaw."
+  echo "Create it with your configuration before starting SiloClaw."
   echo "See deploy/env.example for the required variables."
   echo ""
   echo "Then run: systemctl enable ironclaw && systemctl start ironclaw"
 else
   chmod 600 /opt/ironclaw/.env
-  echo "==> Starting IronClaw"
+  echo "==> Starting SiloClaw"
   systemctl enable ironclaw
   systemctl start ironclaw
 fi

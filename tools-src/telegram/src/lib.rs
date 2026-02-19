@@ -1,4 +1,4 @@
-//! Telegram User-Mode WASM Tool for IronClaw.
+//! Telegram User-Mode WASM Tool for SiloClaw.
 //!
 //! Provides Telegram integration operating from the **user's personal account**,
 //! not a bot. This tool sends encrypted MTProto messages directly to Telegram's

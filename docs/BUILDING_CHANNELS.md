@@ -1,6 +1,6 @@
 # Building WASM Channels
 
-This guide covers how to build WASM channel modules for IronClaw.
+This guide covers how to build WASM channel modules for SiloClaw.
 
 ## Overview
 
@@ -31,7 +31,7 @@ After building, deploy to:
 name = "my-channel"
 version = "0.1.0"
 edition = "2021"
-description = "My messaging platform channel for IronClaw"
+description = "My messaging platform channel for SiloClaw"
 
 [lib]
 crate-type = ["cdylib"]
@@ -248,7 +248,7 @@ Create `my-channel.capabilities.json`:
 
 ### Supply Chain Security: No Committed Binaries
 
-**Do not commit compiled WASM binaries.** They are a supply chain risk — the binary in a PR may not match the source. IronClaw builds channels from source:
+**Do not commit compiled WASM binaries.** They are a supply chain risk — the binary in a PR may not match the source. SiloClaw builds channels from source:
 
 - `cargo build` automatically builds `telegram.wasm` via `build.rs`
 - The built binary is in `.gitignore` and is not committed
@@ -275,7 +275,7 @@ mkdir -p ~/.ironclaw/channels
 cp channels-src/telegram/telegram.wasm channels-src/telegram/telegram.capabilities.json ~/.ironclaw/channels/
 ```
 
-**Note**: The main IronClaw binary bundles `telegram.wasm` via `include_bytes!`. When modifying the Telegram channel source, run `./channels-src/telegram/build.sh` **before** building the main crate, so the updated WASM is included.
+**Note**: The main SiloClaw binary bundles `telegram.wasm` via `include_bytes!`. When modifying the Telegram channel source, run `./channels-src/telegram/build.sh` **before** building the main crate, so the updated WASM is included.
 
 ### Other Channels
 

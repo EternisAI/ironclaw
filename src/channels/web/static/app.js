@@ -1,4 +1,4 @@
-// IronClaw Web Gateway - Client
+// SiloClaw Web Gateway - Client
 
 let token = '';
 let eventSource = null;

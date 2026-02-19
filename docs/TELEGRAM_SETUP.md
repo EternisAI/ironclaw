@@ -1,10 +1,10 @@
 # Telegram Channel Setup
 
-This guide covers configuring the Telegram channel for IronClaw, including DM pairing for access control.
+This guide covers configuring the Telegram channel for SiloClaw, including DM pairing for access control.
 
 ## Overview
 
-The Telegram channel lets you interact with IronClaw via Telegram DMs and groups. It supports:
+The Telegram channel lets you interact with SiloClaw via Telegram DMs and groups. It supports:
 
 - **Webhook mode** (recommended): Instant delivery via tunnel
 - **Polling mode**: No tunnel required; ~30s delay
@@ -13,7 +13,7 @@ The Telegram channel lets you interact with IronClaw via Telegram DMs and groups
 
 ## Prerequisites
 
-- IronClaw installed and configured (`ironclaw onboard`)
+- SiloClaw installed and configured (`ironclaw onboard`)
 - A Telegram bot token from [@BotFather](https://t.me/BotFather)
 
 ## Quick Start
@@ -126,7 +126,7 @@ For webhook validation, set `telegram_webhook_secret` in secrets. Telegram will 
 
 ### Group mentions not working
 
-- Set `bot_username` in config to your bot's username (e.g., `MyIronClawBot`)
+- Set `bot_username` in config to your bot's username (e.g., `MySiloClawBot`)
 - Ensure the message contains `@YourBot` or starts with `/`
 
 ### "Connection refused" when starting

@@ -98,7 +98,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Add proactivity features: memory CLI, session pruning, self-repair notifications, slash commands, status diagnostics, context warnings
 - Add hosted MCP server support with OAuth 2.1 and token refresh
 - Add interactive setup wizard and persistent settings
-- Rebrand to IronClaw with security-first mission
+- Rebrand to SiloClaw with security-first mission
 - Fix build_software tool stuck in planning mode loop
 - Enable sandbox by default
 - Fix Telegram Markdown formatting and clarify tool/memory distinctions
@@ -139,7 +139,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Fix TuiChannel integration and enable in main.rs
 - Integrate Codex patterns: task scheduler, TUI, sessions, compaction
 - Adding LICENSE
-- Add README with IronClaw branding
+- Add README with SiloClaw branding
 - Add WASM sandbox secure API extension
 - Wire database Store into agent loop
 - Implementing WASM runtime

@@ -1,4 +1,4 @@
-# Discord Channel for IronClaw
+# Discord Channel for SiloClaw
 
 WASM channel for Discord integration - handle slash commands and button interactions via webhooks.
 
@@ -13,9 +13,9 @@ WASM channel for Discord integration - handle slash commands and button interact
 
 1. Create a Discord Application at <https://discord.com/developers/applications>
 2. Create a Bot and get the token
-3. Set up Interactions URL to point to your IronClaw instance
+3. Set up Interactions URL to point to your SiloClaw instance
 4. Copy the Application ID and Public Key
-5. Store in IronClaw secrets:
+5. Store in SiloClaw secrets:
 
    ```bash
    ironclaw secret set discord_bot_token YOUR_BOT_TOKEN
@@ -23,7 +23,7 @@ WASM channel for Discord integration - handle slash commands and button interact
 
    **Note:** The `discord_bot_token` secret is the only value read directly by this
    Discord channel WASM component. The `discord_app_id` and `discord_public_key`
-   secrets are used by the IronClaw host (for example, to verify Discord
+   secrets are used by the SiloClaw host (for example, to verify Discord
    interaction signatures and manage slash command registration) and are not
    accessed from the WASM module itself.
 
@@ -96,12 +96,12 @@ To send embeds, include an `embeds` array in the `metadata_json` field of the ag
 
 ### "Invalid Signature"
 
-- Check that `discord_public_key` is set correctly in IronClaw secrets.
+- Check that `discord_public_key` is set correctly in SiloClaw secrets.
 - This validation happens on the host before reaching the WASM.
 
 ### "401 Unauthorized"
 
-- Check that `discord_bot_token` is set correctly in IronClaw secrets.
+- Check that `discord_bot_token` is set correctly in SiloClaw secrets.
 - Ensure the bot is added to the server.
 
 ### "Interaction Failed"

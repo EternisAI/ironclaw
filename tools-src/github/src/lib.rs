@@ -1,4 +1,4 @@
-//! GitHub WASM Tool for IronClaw.
+//! GitHub WASM Tool for SiloClaw.
 //!
 //! Provides GitHub integration for reading repos, managing issues,
 //! reviewing PRs, and triggering workflows.
@@ -279,7 +279,7 @@ fn github_request(method: &str, path: &str, body: Option<String>) -> Result<Stri
     let headers = serde_json::json!({
         "Accept": "application/vnd.github+json",
         "X-GitHub-Api-Version": "2022-11-28",
-        "User-Agent": "IronClaw-GitHub-Tool"
+        "User-Agent": "SiloClaw-GitHub-Tool"
     });
 
     let body_bytes = body.map(|b| b.into_bytes());

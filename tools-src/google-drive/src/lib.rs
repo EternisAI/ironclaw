@@ -1,4 +1,4 @@
-//! Google Drive WASM Tool for IronClaw.
+//! Google Drive WASM Tool for SiloClaw.
 //!
 //! Provides Google Drive integration for searching, accessing, uploading,
 //! sharing, and organizing files and folders. Supports both personal and

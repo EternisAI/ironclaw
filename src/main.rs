@@ -1,4 +1,4 @@
-//! IronClaw - Main entry point.
+//! SiloClaw - Main entry point.
 
 use std::sync::Arc;
 
@@ -342,7 +342,7 @@ async fn main() -> anyhow::Result<()> {
         None
     };
 
-    tracing::info!("Starting IronClaw...");
+    tracing::info!("Starting SiloClaw...");
     tracing::info!("Loaded configuration for agent: {}", config.agent.name);
     tracing::info!("LLM backend: {}", config.llm.backend);
 

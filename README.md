@@ -1,8 +1,8 @@
 <p align="center">
-  <img src="ironclaw.png" alt="IronClaw" width="200"/>
+  <img src="ironclaw.png" alt="SiloClaw" width="200"/>
 </p>
 
-<h1 align="center">IronClaw</h1>
+<h1 align="center">SiloClaw</h1>
 
 <p align="center">
   <strong>Your secure personal AI assistant, always on your side</strong>
@@ -50,16 +50,16 @@ let model = client.completions_api().completion_model(&model_name);
 
 ## Philosophy
 
-IronClaw is built on a simple principle: **your AI assistant should work for you, not against you**.
+SiloClaw is built on a simple principle: **your AI assistant should work for you, not against you**.
 
-In a world where AI systems are increasingly opaque about data handling and aligned with corporate interests, IronClaw takes a different approach:
+In a world where AI systems are increasingly opaque about data handling and aligned with corporate interests, SiloClaw takes a different approach:
 
 - **Your data stays yours** - All information is stored locally, encrypted, and never leaves your control
 - **Transparency by design** - Open source, auditable, no hidden telemetry or data harvesting
 - **Self-expanding capabilities** - Build new tools on the fly without waiting for vendor updates
 - **Defense in depth** - Multiple security layers protect against prompt injection and data exfiltration
 
-IronClaw is the AI assistant you can actually trust with your personal and professional life.
+SiloClaw is the AI assistant you can actually trust with your personal and professional life.
 
 ## Features
 
@@ -82,7 +82,7 @@ IronClaw is the AI assistant you can actually trust with your personal and profe
 
 ### Self-Expanding
 
-- **Dynamic Tool Building** - Describe what you need, and IronClaw builds it as a WASM tool
+- **Dynamic Tool Building** - Describe what you need, and SiloClaw builds it as a WASM tool
 - **MCP Protocol** - Connect to Model Context Protocol servers for additional capabilities
 - **Plugin Architecture** - Drop in new WASM tools and channels without restarting
 
@@ -161,7 +161,7 @@ psql ironclaw -c "CREATE EXTENSION IF NOT EXISTS vector;"
 
 ## Configuration
 
-Run the setup wizard to configure IronClaw:
+Run the setup wizard to configure SiloClaw:
 
 ```bash
 ironclaw onboard
@@ -173,7 +173,7 @@ and secrets encryption (using your system keychain). All settings are saved to
 
 ## Security
 
-IronClaw implements defense in depth to protect your data and prevent misuse.
+SiloClaw implements defense in depth to protect your data and prevent misuse.
 
 ### WASM Sandbox
 
@@ -303,7 +303,7 @@ cargo check --all-features                           # all features
 
 ## OpenClaw Heritage
 
-IronClaw is a Rust reimplementation inspired by [OpenClaw](https://github.com/openclaw/openclaw). See [FEATURE_PARITY.md](FEATURE_PARITY.md) for the complete tracking matrix.
+SiloClaw is a Rust reimplementation inspired by [OpenClaw](https://github.com/openclaw/openclaw). See [FEATURE_PARITY.md](FEATURE_PARITY.md) for the complete tracking matrix.
 
 Key differences:
 

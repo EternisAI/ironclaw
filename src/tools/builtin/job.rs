@@ -429,7 +429,7 @@ impl Tool for CreateJobTool {
                     "mode": {
                         "type": "string",
                         "enum": ["worker", "claude_code"],
-                        "description": "Execution mode. 'worker' (default) uses the IronClaw sub-agent. \
+                        "description": "Execution mode. 'worker' (default) uses the SiloClaw sub-agent. \
                                         'claude_code' uses Claude Code CLI for full agentic software engineering."
                     }
                 },

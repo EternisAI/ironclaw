@@ -1,4 +1,4 @@
-//! Google Docs WASM Tool for IronClaw.
+//! Google Docs WASM Tool for SiloClaw.
 //!
 //! Provides Google Docs integration for creating, reading, editing,
 //! and formatting documents. Use Google Drive tool to search for

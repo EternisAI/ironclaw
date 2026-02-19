@@ -1,4 +1,4 @@
-//! Google Sheets WASM Tool for IronClaw.
+//! Google Sheets WASM Tool for SiloClaw.
 //!
 //! Provides Google Sheets integration for creating, reading, writing,
 //! and formatting spreadsheets. Use Google Drive tool to search for
