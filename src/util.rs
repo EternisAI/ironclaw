@@ -72,7 +72,7 @@ pub fn llm_mentions_tool_intent(response: &str, tool_names: &[&str]) -> bool {
         if let Some(phrase_pos) = lower.find(phrase) {
             // Look for a tool name within 80 chars after the intent phrase
             let window_start = phrase_pos + phrase.len();
-            let window_end = lower.floor_char_boundary((window_start + 80).min(lower.len()));
+            let window_end = floor_char_boundary(&lower, (window_start + 80).min(lower.len()));
             let window = &lower[window_start..window_end];
 
             for tool_name in tool_names {
