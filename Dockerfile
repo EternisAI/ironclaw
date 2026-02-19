@@ -15,13 +15,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
-# Copy manifests first for layer caching
-COPY Cargo.toml Cargo.lock ./
-
-# Copy source and build artifacts
-COPY src/ src/
-COPY migrations/ migrations/
-COPY wit/ wit/
+COPY . .
 
 RUN cargo build --release --bin ironclaw
 
